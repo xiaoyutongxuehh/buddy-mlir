@@ -37,12 +37,24 @@
 #include "AME/AMEDialect.h"
 #include "AME/AMEOps.h"
 #include "AME/Transform.h"
+#include "BOSCAME/BOSCAMEDialect.h"
+#include "BOSCAME/BOSCAMEOps.h"
+#include "BOSCAME/Transform.h"
 #include "Bud/BudDialect.h"
 #include "Bud/BudOps.h"
 #include "DAP/DAPDialect.h"
 #include "DAP/DAPOps.h"
 #include "DIP/DIPDialect.h"
 #include "DIP/DIPOps.h"
+#include "Tile/TileDialect.h"
+#include "Tile/TileOps.h"
+#include "Trace/TraceDialect.h"
+#include "Trace/TraceOps.h"
+#include "Trace/Transforms/BufferizableOpInterfaceImpl.h"
+#ifdef BUDDY_EXTERNAL_DIALECTS
+#include "Dialect/Buckyball/BuckyballDialect.h"
+#include "Dialect/Buckyball/BuckyballOps.h"
+#endif
 #include "GPU/TransformOps.h"
 #include "Gemmini/GemminiDialect.h"
 #include "Gemmini/GemminiOps.h"
@@ -80,8 +92,10 @@ void registerLowerRVVPass();
 void registerMatMulOptimizePass();
 void registerMatMulVectorizationPass();
 void registerMatMulVectorizationDecodePass();
+void registerMatMulVectorizationDecodePackedPass();
 void registerDequantMatMulVectorizationDecodePass();
 void registerInt4DequantMatMulVectorizationDecodePass();
+void registerMatMulParallelVectorizationTilingPass();
 void registerMatMulParallelVectorizationPass();
 void registerMatMulTransposeBUnrollVecPass();
 void registerMatmulAMXPass();
@@ -91,17 +105,30 @@ void registerConvNhwcFhwcOptimizePass();
 void registerConvNhwcFhwcTileOptimizePass();
 void registerDepthwiseConv2DNhwcHwcOptimizePass();
 void registerLowerVectorExpPass();
+void registerLowerLinalgToTilePass();
+#ifdef BUDDY_EXTERNAL_DIALECTS
+void registerLowerTileToBuckyballPass();
+void registerLowerBuckyballToBankSSAPass();
+void registerAssignPhysicalBanksPass();
+void registerLowerBankSSAToIntrinsicsPass();
+void registerReportBankUsagePass();
+void registerLowerBuckyballPass();
+#endif
 void registerLowerGemminiPass();
+void registerLowerLinalgToBOSCAMEPass();
 void registerLowerLinalgToGemminiPass();
 void registerLowerLinalgToIMEPass();
 void registerLowerIMEPass();
 void registerLowerAMEPass();
 void registerLowerXTAMEPass();
+void registerLowerBOSCAMEPass();
 void registerAssumeTightMemRefLayoutPass();
 void registerStaticizeMemRefLayoutPass();
 void registerConvertMemcpyToGPUPass();
+void registerConvertStridedMemrefCopyToLinalgPass();
 void registerLegalizeShmemOutliningPass();
 void registerMatMulTransposeBVecPass();
+void registerMatMulTransposeBVecDecodePass();
 void registerLegalizeShmemOutliningPass();
 void registerVIRToVectorPass();
 void registerLinalgToVIRPass();
@@ -110,6 +137,8 @@ void registerSimplifyTosaReshapePass();
 void registerSiLUFusionPass();
 void registerSimplifyTosaMatmulScalarPass();
 void registerEliminateMemRefCopyPass();
+void registerEliminateLargeZeroConstantsPass();
+void registerConvertTraceToLLVMPass();
 } // namespace buddy
 } // namespace mlir
 
@@ -131,12 +160,23 @@ int main(int argc, char **argv) {
   mlir::buddy::registerDAPVectorizePass();
   mlir::buddy::registerLowerRVVPass();
   mlir::buddy::registerLowerVectorExpPass();
+  mlir::buddy::registerLowerLinalgToTilePass();
+#ifdef BUDDY_EXTERNAL_DIALECTS
+  mlir::buddy::registerLowerTileToBuckyballPass();
+  mlir::buddy::registerLowerBuckyballToBankSSAPass();
+  mlir::buddy::registerAssignPhysicalBanksPass();
+  mlir::buddy::registerLowerBankSSAToIntrinsicsPass();
+  mlir::buddy::registerReportBankUsagePass();
+  mlir::buddy::registerLowerBuckyballPass();
+#endif
   mlir::buddy::registerLowerGemminiPass();
+  mlir::buddy::registerLowerLinalgToBOSCAMEPass();
   mlir::buddy::registerLowerLinalgToGemminiPass();
   mlir::buddy::registerLowerLinalgToIMEPass();
   mlir::buddy::registerLowerIMEPass();
   mlir::buddy::registerLowerAMEPass();
   mlir::buddy::registerLowerXTAMEPass();
+  mlir::buddy::registerLowerBOSCAMEPass();
 
   // Register Several Optimize Pass.
   mlir::buddy::registerMatMulVectorizationBLISPass();
@@ -146,8 +186,10 @@ int main(int argc, char **argv) {
   mlir::buddy::registerBatchMatMuSCFOptimize();
   mlir::buddy::registerBatchMatMulTransVecPass();
   mlir::buddy::registerBatchMatMulVectorizationDecodePass();
+  mlir::buddy::registerMatMulParallelVectorizationTilingPass();
   mlir::buddy::registerMatMulVectorizationPass();
   mlir::buddy::registerMatMulVectorizationDecodePass();
+  mlir::buddy::registerMatMulVectorizationDecodePackedPass();
   mlir::buddy::registerDequantMatMulVectorizationDecodePass();
   mlir::buddy::registerInt4DequantMatMulVectorizationDecodePass();
   mlir::buddy::registerMatMulParallelVectorizationPass();
@@ -161,6 +203,7 @@ int main(int argc, char **argv) {
   mlir::buddy::registerAssumeTightMemRefLayoutPass();
   mlir::buddy::registerStaticizeMemRefLayoutPass();
   mlir::buddy::registerMatMulTransposeBVecPass();
+  mlir::buddy::registerMatMulTransposeBVecDecodePass();
   mlir::buddy::registerVIRToVectorPass();
   mlir::buddy::registerLinalgToVIRPass();
   // Register minimal TOSA reshape simplification pass.
@@ -169,15 +212,21 @@ int main(int argc, char **argv) {
   mlir::buddy::registerSimplifyTosaMatmulScalarPass();
   // Register eliminate redundant memref.copy pass.
   mlir::buddy::registerEliminateMemRefCopyPass();
+  // Register eliminate large zero constants pass.
+  mlir::buddy::registerEliminateLargeZeroConstantsPass();
+  // Register trace conversion pipeline.
+  mlir::buddy::registerConvertTraceToLLVMPass();
   mlir::buddy::registerSiLUFusionPass();
   // Register gpu passes
   mlir::buddy::registerConvertMemcpyToGPUPass();
+  mlir::buddy::registerConvertStridedMemrefCopyToLinalgPass();
   mlir::buddy::registerLegalizeShmemOutliningPass();
 
   mlir::DialectRegistry registry;
   // Register all MLIR core dialects.
   registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
+  buddy::trace::registerBufferizableOpInterfaceExternalModels(registry);
   // Register dialects in buddy-mlir project.
   // clang-format off
   registry.insert<buddy::bud::BudDialect,
@@ -187,10 +236,16 @@ int main(int argc, char **argv) {
                   buddy::vector_exp::VectorExpDialect,
                   buddy::vir::VIRDialect,
                   buddy::gemmini::GemminiDialect,
+                  buddy::boscame::BOSCAMEDialect,
                   buddy::xtame::XTAMEDialect,
                   buddy::ame::AMEDialect,
+                  buddy::tile::TileDialect,
+                  buddy::trace::BuddyTraceDialect,
                   buddy::ime::IMEDialect>();
   // clang-format on
+#ifdef BUDDY_EXTERNAL_DIALECTS
+  registry.insert<buddy::buckyball::BuckyballDialect>();
+#endif
 
   mlir::buddy::registerBuddyGPUTransformOps(registry);
 

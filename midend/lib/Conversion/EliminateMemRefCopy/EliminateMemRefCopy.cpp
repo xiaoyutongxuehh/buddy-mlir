@@ -32,6 +32,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
@@ -41,6 +42,45 @@
 using namespace mlir;
 
 namespace {
+
+static bool isFunctionArgument(Value value) {
+  auto arg = dyn_cast<BlockArgument>(value);
+  if (!arg)
+    return false;
+  return isa<func::FuncOp>(arg.getOwner()->getParentOp());
+}
+
+static Value getFunctionArgumentRoot(Value value) {
+  if (isFunctionArgument(value))
+    return value;
+
+  if (auto castOp = value.getDefiningOp<memref::CastOp>())
+    return getFunctionArgumentRoot(castOp.getSource());
+
+  if (auto reinterpretOp = value.getDefiningOp<memref::ReinterpretCastOp>())
+    return getFunctionArgumentRoot(reinterpretOp.getSource());
+
+  if (auto result = dyn_cast<OpResult>(value)) {
+    if (auto metadataOp =
+            dyn_cast<memref::ExtractStridedMetadataOp>(result.getOwner()))
+      return getFunctionArgumentRoot(metadataOp.getSource());
+  }
+
+  return {};
+}
+
+static bool isAliasOfFunctionArgument(Value value) {
+  return static_cast<bool>(getFunctionArgumentRoot(value));
+}
+
+static bool areAllUsesDominatedBy(Value value, Operation *dominator,
+                                  DominanceInfo &dominance) {
+  for (OpOperand &use : value.getUses()) {
+    if (!dominance.dominates(dominator, use.getOwner()))
+      return false;
+  }
+  return true;
+}
 
 // Pattern to eliminate memref.copy from function arguments to allocations
 struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
@@ -52,15 +92,36 @@ struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
     Value source = copyOp.getSource();
     Value dest = copyOp.getTarget();
 
-    // Check if source is a block argument (function argument)
-    BlockArgument sourceArg = dyn_cast<BlockArgument>(source);
-    if (!sourceArg)
+    // Check if the source is a function argument or an alias rooted at one.
+    if (!isAliasOfFunctionArgument(source))
       return failure();
 
-    // Check if the source is a function argument (not a block argument from a
-    // loop)
-    Block *sourceBlock = sourceArg.getOwner();
-    if (!isa<func::FuncOp>(sourceBlock->getParentOp()))
+    // Replacing the snapshot allocation with the source argument is unsafe if
+    // the original source is also modified elsewhere. In particular, a swap
+    // lowers to two argument-to-allocation snapshots followed by copies back
+    // to both arguments. Eliminating the snapshots makes the second copy read
+    // the value written by the first one.
+    Value sourceRoot = getFunctionArgumentRoot(source);
+    func::FuncOp func = copyOp->getParentOfType<func::FuncOp>();
+    bool sourceIsExternallyModified = false;
+    func.walk([&](Operation *operation) {
+      if (operation == copyOp.getOperation())
+        return WalkResult::advance();
+
+      if (auto otherCopy = dyn_cast<memref::CopyOp>(operation)) {
+        if (getFunctionArgumentRoot(otherCopy.getTarget()) == sourceRoot) {
+          sourceIsExternallyModified = true;
+          return WalkResult::interrupt();
+        }
+      } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+        if (getFunctionArgumentRoot(store.getMemRef()) == sourceRoot) {
+          sourceIsExternallyModified = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (sourceIsExternallyModified)
       return failure();
 
     // Check if destination is an allocation
@@ -82,13 +143,37 @@ struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
     if (sourceType.getShape() != destType.getShape())
       return failure();
 
-    // Collect all uses of the allocation
-    SmallVector<OpOperand *> uses;
+    // Collect all uses of the allocation. A few bufferization patterns create
+    // a cast of the allocation before the copy and only use that cast after
+    // the copy. Rebuild those casts from the replacement value so the copy can
+    // still be eliminated without violating dominance.
+    SmallVector<OpOperand *> dominatedUses;
+    SmallVector<memref::CastOp> preCopyCasts;
+    SmallVector<memref::DeallocOp> deallocs;
+    DominanceInfo dominance(allocOp->getParentOp());
     for (OpOperand &use : allocOp->getUses()) {
       // Skip the copy operation itself
       if (use.getOwner() == copyOp.getOperation())
         continue;
-      uses.push_back(&use);
+      // The allocation will be removed, so its dealloc should be removed too.
+      // Retargeting it to a function argument alias is invalid.
+      if (auto deallocOp = dyn_cast<memref::DeallocOp>(use.getOwner())) {
+        deallocs.push_back(deallocOp);
+        continue;
+      }
+
+      if (dominance.dominates(copyOp.getOperation(), use.getOwner())) {
+        dominatedUses.push_back(&use);
+        continue;
+      }
+
+      auto castOp = dyn_cast<memref::CastOp>(use.getOwner());
+      if (!castOp || use.getOperandNumber() != 0 ||
+          !areAllUsesDominatedBy(castOp.getResult(), copyOp.getOperation(),
+                                 dominance))
+        return failure();
+
+      preCopyCasts.push_back(castOp);
     }
 
     // Check if source has strided layout and needs conversion
@@ -112,7 +197,7 @@ struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
 
           // Extract metadata to get actual stride values
           auto metadata =
-              builder.create<memref::ExtractStridedMetadataOp>(loc, source);
+              memref::ExtractStridedMetadataOp::create(builder, loc, source);
 
           // Get the rank
           int64_t rank = sourceType.getRank();
@@ -163,9 +248,9 @@ struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
               tightenedLayout, sourceType.getMemorySpace());
 
           // Create reinterpret_cast with tightened layout
-          Value tightened = builder.create<memref::ReinterpretCastOp>(
-              loc, tightenedType, metadata.getBaseBuffer(), offset, sizes,
-              stridesOfr);
+          Value tightened = memref::ReinterpretCastOp::create(
+              builder, loc, tightenedType, metadata.getBaseBuffer(), offset,
+              sizes, stridesOfr);
 
           // Then cast to static layout type (no layout information)
           // This ensures compatibility with function signatures
@@ -175,18 +260,39 @@ struct EliminateMemRefCopyPattern : public OpRewritePattern<memref::CopyOp> {
               sourceType.getMemorySpace());
 
           replacementValue =
-              builder.create<memref::CastOp>(loc, finalType, tightened);
+              memref::CastOp::create(builder, loc, finalType, tightened);
         }
       }
     }
 
+    // Rebuild pre-copy casts at the copy position using the replacement value.
+    rewriter.setInsertionPoint(copyOp);
+    SmallVector<Operation *> aliasOpsToErase;
+    for (memref::CastOp castOp : preCopyCasts) {
+      Value aliasReplacement = replacementValue;
+      Type aliasType = castOp.getResult().getType();
+      if (aliasReplacement.getType() != aliasType)
+        aliasReplacement = memref::CastOp::create(rewriter, castOp.getLoc(),
+                                                  aliasType, aliasReplacement);
+      castOp.getResult().replaceAllUsesWith(aliasReplacement);
+      aliasOpsToErase.push_back(castOp.getOperation());
+    }
+
     // Replace all uses of the allocation with the replacement value
-    for (OpOperand *use : uses) {
+    for (OpOperand *use : dominatedUses) {
       use->set(replacementValue);
     }
 
     // Erase the copy operation
     rewriter.eraseOp(copyOp);
+
+    for (Operation *aliasOp : aliasOpsToErase) {
+      if (aliasOp->use_empty())
+        rewriter.eraseOp(aliasOp);
+    }
+
+    for (memref::DeallocOp deallocOp : deallocs)
+      rewriter.eraseOp(deallocOp);
 
     // Erase the allocation if it has no more uses
     if (allocOp->use_empty()) {

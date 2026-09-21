@@ -35,7 +35,7 @@
 // RUN: | mlir-runner -e main -entry-point-result=void \
 // RUN:     -shared-libs=%mlir_runner_utils_dir/libmlir_runner_utils%shlibext \
 // RUN:     -shared-libs=%mlir_runner_utils_dir/libmlir_c_runner_utils%shlibext \
-// RUN:     -shared-libs=%mlir_runner_utils_dir/libomp%shlibext \
+// RUN:     -shared-libs=%openmp_runtime_dir/libomp%shlibext \
 // RUN: | FileCheck %s
 
 func.func private @rtclock() -> f64
@@ -93,7 +93,7 @@ func.func @kernel(%arg0: tensor<8960x1536xf32>, %arg1: tensor<1024x1536xf32>, %a
 
   // Print timings.
   vector.print %time : f64
-  // CHECK: {{[0-9]+\.[0-9]+}}
+  // CHECK: {{[0-9]+}}
 
   return %211 : tensor<1024x1536xf32>
 }

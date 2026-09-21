@@ -9,18 +9,20 @@ let
   pythonEnv = python3.withPackages (ps: [
     ps.numpy
     ps.pybind11
+    ps.nanobind
     ps.pyyaml
     ps.ml-dtypes
+    ps.nanobind
   ]);
 in
 stdenv.mkDerivation rec {
   name = "llvm-for-buddy-mlir";
-  version = "6c59f0e1b0fb56c909ad7c9aad4bde37dc006ae0";
+  version = "01f36b39bd2475a271bbeb95fb9db8ed65e2d065";
   src = fetchFromGitHub {
     owner = "llvm";
     repo = "llvm-project";
     rev = version;
-    hash = "sha256-bMJJ2q1hSh7m0ewclHOmIe7lOHv110rz/P7D3pw8Uiw=";
+    hash = "sha256-JzMItIr8ZGrQ8LcLRrjucIEdTZInR6BTpiwB1SIQFhk=";
   };
 
   requiredSystemFeatures = [ "big-parallel" ];
@@ -36,14 +38,17 @@ stdenv.mkDerivation rec {
 
   cmakeDir = "../llvm";
   cmakeFlags = [
-    "-DLLVM_ENABLE_PROJECTS=mlir"
+    "-DLLVM_ENABLE_PROJECTS=mlir;clang"
     "-DLLVM_TARGETS_TO_BUILD=host;RISCV"
     "-DLLVM_ENABLE_ASSERTIONS=ON"
     "-DCMAKE_BUILD_TYPE=Release"
     # required for MLIR python binding
     "-DMLIR_ENABLE_BINDINGS_PYTHON=ON"
+    "-DPython3_EXECUTABLE=${pythonEnv}/bin/python3"
     # required for not, FileCheck...
     "-DLLVM_INSTALL_UTILS=ON"
+    # Fix Clang 22 C2y extension warnings in benchmark library
+    "-DCMAKE_CXX_FLAGS=-Wno-c2y-extensions"
   ];
 
   outputs = [ "out" "lib" "dev" ];
@@ -56,12 +61,21 @@ stdenv.mkDerivation rec {
     # We have to do some hack
     cp -v "include/llvm/Config/config.h" "$dev/include/llvm/Config/config.h"
 
+    # copy MLIR Python extension source files from $out to $dev
+    # this is needed because MLIRTargets.cmake references these sources via _IMPORT_PREFIX
+    # which resolves to $dev, but the sources are installed to $out
+    mkdir -p "$dev/src"
+    cp -rv "$out/src/python" "$dev/src/"
+
     # move llvm-config to $dev to resolve a circular dependency
     moveToOutput "bin/llvm-config*" "$dev"
 
     # move all lib files to $lib except lib/cmake
     moveToOutput "lib" "$lib"
     moveToOutput "lib/cmake" "$dev"
+
+    # move python source files to $dev so buddy-mlir can find them via cmake
+    moveToOutput "src/python" "$dev"
 
     # patch configuration files so each path points to the new $lib or $dev paths
     substituteInPlace "$dev/lib/cmake/llvm/LLVMConfig.cmake" \

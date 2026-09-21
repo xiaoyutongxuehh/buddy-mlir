@@ -2,6 +2,15 @@ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
 
+set(BuddyOptExtraLibs)
+if(BUDDY_ENABLE_EXTERNAL_DIALECTS)
+  list(APPEND BuddyOptExtraLibs
+    BuddyBuckyball
+    LowerBuckyballPass
+    LowerTileToBuckyballPass
+    )
+endif()
+
 add_llvm_tool(buddy-opt
   buddy-opt.cpp
 )
@@ -11,6 +20,9 @@ target_link_libraries(buddy-opt
   ${dialect_libs}
   ${conversion_libs}
   ${extension_libs}
+  MLIRRegisterAllDialects
+  MLIRRegisterAllExtensions
+  MLIRRegisterAllPasses
   MLIROptLib
   CBConvVectorization
   BuddyBud
@@ -19,6 +31,10 @@ target_link_libraries(buddy-opt
   LowerDIPPass
   BuddyDAP
   LowerDAPPass
+  BuddyTile
+  BuddyTrace
+  LowerLinalgToTilePass
+  ${BuddyOptExtraLibs}
   ExtendDAPPass
   DAPVectorization
   BuddyRVV
@@ -34,6 +50,7 @@ target_link_libraries(buddy-opt
   LowerVectorExpPass
   BuddyGemmini
   LowerGemminiPass
+  LowerLinalgToBOSCAMEPass
   LowerLinalgToGemminiPass
   LowerLinalgToIMEPass
   BuddyIME
@@ -43,7 +60,11 @@ target_link_libraries(buddy-opt
   BuddyAMETransforms
   BuddyXTAME
   BuddyXTAMETransforms
+  BuddyBOSCAME
+  BuddyBOSCAMETransforms
   MLIRGPUPasses
+  MLIRTransformDialect
+  MLIRTransformDialectUtils
   BuddyGPUTransformOPs
   MLIRTestTransforms
   MLIRTestTransformDialect
@@ -56,4 +77,6 @@ target_link_libraries(buddy-opt
   AssumeTightMemRefLayoutPass
   StaticizeMemRefLayoutPass
   EliminateMemRefCopyPass
+  EliminateLargeZeroConstants
+  TraceInsert
   )

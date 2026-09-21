@@ -14,7 +14,7 @@ module {
 
   // Test multi-dimensional case with strided layout
   func.func @test_multidim(%arg0: memref<1x2x1024x128xf32, strided<[?, ?, ?, ?], offset: ?>>) -> memref<1x2x1024x128xf32> {
-    %alloc = memref.alloc() {alignment = 64 : i64} : memref<1x2x1024x128xf32>
+    %alloc = memref.alloc() alignment = 64 : memref<1x2x1024x128xf32>
     memref.copy %arg0, %alloc : memref<1x2x1024x128xf32, strided<[?, ?, ?, ?], offset: ?>> to memref<1x2x1024x128xf32>
     // Use the allocated memref
     %c0 = arith.constant 0 : index
@@ -36,6 +36,68 @@ module {
     %sum = arith.addf %val0, %val1 : f32
     memref.store %sum, %alloc[%c0] : memref<5xf32>
     return %alloc : memref<5xf32>
+  }
+
+  // Test a copy whose source is an alias of a function argument. This mirrors
+  // the cache update shape produced after a previous copy is eliminated.
+  func.func @test_alias_chain(%arg0: memref<1x2x1024x128xf32, strided<[?, ?, ?, ?], offset: ?>>) -> memref<1x2x1024x128xf32> {
+    %base, %offset, %sizes:4, %strides:4 = memref.extract_strided_metadata %arg0 : memref<1x2x1024x128xf32, strided<[?, ?, ?, ?], offset: ?>> -> memref<f32>, index, index, index, index, index, index, index, index, index
+    %reinterpret_cast = memref.reinterpret_cast %base to offset: [%offset], sizes: [1, 2, 1024, 128], strides: [%strides#0, %strides#1, %strides#2, 1] : memref<f32> to memref<1x2x1024x128xf32, strided<[?, ?, ?, 1], offset: ?>>
+    %cast = memref.cast %reinterpret_cast : memref<1x2x1024x128xf32, strided<[?, ?, ?, 1], offset: ?>> to memref<1x2x1024x128xf32>
+    %alloc = memref.alloc() : memref<1x2x1024x128xf32>
+    memref.copy %cast, %alloc : memref<1x2x1024x128xf32> to memref<1x2x1024x128xf32>
+    %c0 = arith.constant 0 : index
+    %val = memref.load %alloc[%c0, %c0, %c0, %c0] : memref<1x2x1024x128xf32>
+    memref.store %val, %alloc[%c0, %c0, %c0, %c0] : memref<1x2x1024x128xf32>
+    return %alloc : memref<1x2x1024x128xf32>
+  }
+
+  // Test that the dealloc of an eliminated allocation is removed instead of
+  // being retargeted to a function argument alias.
+  func.func @test_dealloc_removed(%arg0: memref<10xf32, strided<[?], offset: ?>>) {
+    %alloc = memref.alloc() : memref<10xf32>
+    memref.copy %arg0, %alloc : memref<10xf32, strided<[?], offset: ?>> to memref<10xf32>
+    %c0 = arith.constant 0 : index
+    %val = memref.load %alloc[%c0] : memref<10xf32>
+    memref.store %val, %alloc[%c0] : memref<10xf32>
+    memref.dealloc %alloc : memref<10xf32>
+    return
+  }
+
+  // Test that a pre-copy cast alias can be rebuilt at the copy point and the
+  // copy can still be eliminated.
+  func.func @test_use_before_copy(%arg0: memref<10xf32, strided<[?], offset: ?>>) -> memref<10xf32, strided<[?], offset: ?>> {
+    %alloc = memref.alloc() : memref<10xf32>
+    %cast = memref.cast %alloc : memref<10xf32> to memref<10xf32, strided<[?], offset: ?>>
+    memref.copy %arg0, %alloc : memref<10xf32, strided<[?], offset: ?>> to memref<10xf32>
+    return %cast : memref<10xf32, strided<[?], offset: ?>>
+  }
+
+  // Test that the copy is preserved when the pre-copy alias is actually read
+  // before the copy.
+  func.func @test_real_use_before_copy(%arg0: memref<10xf32, strided<[?], offset: ?>>) -> f32 {
+    %alloc = memref.alloc() : memref<10xf32>
+    %cast = memref.cast %alloc : memref<10xf32> to memref<10xf32, strided<[?], offset: ?>>
+    %c0 = arith.constant 0 : index
+    %val = memref.load %cast[%c0] : memref<10xf32, strided<[?], offset: ?>>
+    memref.copy %arg0, %alloc : memref<10xf32, strided<[?], offset: ?>> to memref<10xf32>
+    return %val : f32
+  }
+
+  // Both allocations are snapshots. Replacing them with the function
+  // arguments would turn the second write into a read of the already modified
+  // first argument and break swap semantics.
+  func.func @test_swap_preserves_snapshots(
+      %arg0: memref<10xf32>, %arg1: memref<10xf32>) {
+    %lhs = memref.alloc() : memref<10xf32>
+    %rhs = memref.alloc() : memref<10xf32>
+    memref.copy %arg0, %lhs : memref<10xf32> to memref<10xf32>
+    memref.copy %arg1, %rhs : memref<10xf32> to memref<10xf32>
+    memref.copy %rhs, %arg0 : memref<10xf32> to memref<10xf32>
+    memref.copy %lhs, %arg1 : memref<10xf32> to memref<10xf32>
+    memref.dealloc %rhs : memref<10xf32>
+    memref.dealloc %lhs : memref<10xf32>
+    return
   }
 }
 
@@ -75,4 +137,47 @@ module {
 // CHECK: memref.load
 // CHECK: arith.addf
 // CHECK: memref.store
+// CHECK: return
+
+// CHECK-LABEL: func.func @test_alias_chain
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: memref.extract_strided_metadata
+// CHECK: memref.reinterpret_cast
+// CHECK-SAME: strided<[?, ?, ?, 1]
+// CHECK: memref.cast
+// CHECK-SAME: memref<1x2x1024x128xf32>
+// CHECK: memref.load
+// CHECK: memref.store
+// CHECK: return
+
+// CHECK-LABEL: func.func @test_dealloc_removed
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: memref.extract_strided_metadata
+// CHECK: memref.reinterpret_cast
+// CHECK: memref.load
+// CHECK: memref.store
+// CHECK-NOT: memref.dealloc
+// CHECK: return
+
+// CHECK-LABEL: func.func @test_use_before_copy
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: memref.extract_strided_metadata
+// CHECK: memref.reinterpret_cast
+// CHECK: memref.cast
+// CHECK-NOT: memref.copy
+// CHECK: return
+
+// CHECK-LABEL: func.func @test_real_use_before_copy
+// CHECK: memref.alloc
+// CHECK: memref.load
+// CHECK: memref.copy
+// CHECK: return
+
+// CHECK-LABEL: func.func @test_swap_preserves_snapshots
+// CHECK-COUNT-2: memref.alloc
+// CHECK-COUNT-4: memref.copy
+// CHECK-COUNT-2: memref.dealloc
 // CHECK: return

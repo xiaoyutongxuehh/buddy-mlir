@@ -1,4 +1,4 @@
-# ===- setup.py -----------------------------------------------------------------
+# ===- setup.py ----------------------------------------------------------------
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# ===---------------------------------------------------------------------------
+# ===--------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -21,16 +21,18 @@ import shutil
 from pathlib import Path
 
 from setuptools import find_namespace_packages, find_packages, setup
-from setuptools.dist import Distribution
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from setuptools.command.build import build as _build
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.dist import Distribution
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 ROOT = Path(__file__).parent.resolve()
+PY_LIMITED_API = os.environ.get("BUDDY_PY_LIMITED_API")
 
 
 def _resolve_build_dir() -> Path:
-    """Resolve the CMake build directory that already contains compiled outputs."""
+    """Resolve the CMake build directory
+    that already contains compiled outputs."""
     build_dir = Path(os.environ.get("BUDDY_BUILD_DIR", "build"))
     if not build_dir.is_absolute():
         build_dir = ROOT / build_dir
@@ -49,20 +51,16 @@ if not PYTHON_PACKAGES_DIR.exists():
         "before building the wheel (default build dir: ./build)."
     )
 
-REL_PYTHON_PACKAGES_DIR = os.path.relpath(PYTHON_PACKAGES_DIR, ROOT)
-if REL_PYTHON_PACKAGES_DIR.startswith(".."):
-    raise SystemExit(
-        f"BUDDY_BUILD_DIR must reside inside the project root ({ROOT}) so packaging "
-        f"can use relative paths. Current: {PYTHON_PACKAGES_DIR}"
-    )
-
-# Stage python packages into the build tree so setuptools never sees absolute paths.
-STAGING_ROOT = CMAKE_BUILD / "py-stage"
+# Stage under the CMake build tree. Docker release builds run as root, so
+# staging inside the checked-out repository can leave root-owned files that the
+# next actions/checkout cannot clean up on self-hosted runners.
+STAGING_ROOT = CMAKE_BUILD / ".py-stage"
 if STAGING_ROOT.exists():
     shutil.rmtree(STAGING_ROOT)
 STAGING_ROOT.mkdir(parents=True, exist_ok=True)
 STAGING_SRC = STAGING_ROOT / "python_packages"
-# Copy python outputs but drop any pre-existing egg-info that may carry absolute paths.
+# Copy python outputs but drop any pre-existing egg-info that may carry
+# absolute paths.
 shutil.copytree(
     PYTHON_PACKAGES_DIR,
     STAGING_SRC,
@@ -78,6 +76,7 @@ packages = sorted(set(buddy_pkgs + mlir_pkgs + wrapper_pkgs))
 
 package_dir = {
     "": SRC_DIR,
+    # TODO: Move buddy_tools staging into the CMake packaging flow too.
     "buddy_tools": "tools/buddy_tools",
 }
 
@@ -89,14 +88,17 @@ class build_py(_build_py):
         self._extra_outputs = []
         super().run()
 
-        self._copy_tree(
-            STAGING_SRC / "buddy_mlir" / "_mlir_libs",
-            Path(self.build_lib) / "buddy_mlir" / "_mlir_libs",
-        )
-
+        mlir_libs_dir = Path(self.build_lib) / "buddy_mlir" / "_mlir_libs"
         tools_root = Path(self.build_lib) / "buddy_tools"
+
+        self._copy_tree(
+            STAGING_SRC / "buddy_mlir" / "_mlir_libs", mlir_libs_dir
+        )
+        self._check_limited_api_outputs(mlir_libs_dir)
+
         self._copy_tree(BIN_DIR, tools_root / "bin", allow_missing=True)
         self._copy_tree(LIB_DIR, tools_root / "lib", allow_missing=True)
+        # self._copy_tree(LIB_DIR, mlir_libs_dir, allow_missing=True)
 
     def get_outputs(self, include_bytecode: bool = True):
         outputs = super().get_outputs(include_bytecode)
@@ -115,12 +117,14 @@ class build_py(_build_py):
         try:
             if dst.resolve().is_relative_to(src.resolve()):
                 raise SystemExit(f"Refusing to copy {src} into itself ({dst})")
-        except AttributeError:
+        except AttributeError as err:
             # Python <3.9 compatibility: manual check
             src_resolved = src.resolve()
             dst_resolved = dst.resolve()
             if str(dst_resolved).startswith(str(src_resolved)):
-                raise SystemExit(f"Refusing to copy {src} into itself ({dst})")
+                raise SystemExit(
+                    f"Refusing to copy {src} into itself ({dst})"
+                ) from err
 
         for path in src.rglob("*"):
             if not path.is_file():
@@ -131,6 +135,29 @@ class build_py(_build_py):
             shutil.copy2(path, target)
             self._extra_outputs.append(str(target))
 
+    def _check_limited_api_outputs(self, mlir_libs_dir: Path):
+        if not PY_LIMITED_API:
+            return
+
+        cpython_extensions = sorted(mlir_libs_dir.glob("*.cpython-*.so"))
+        if cpython_extensions:
+            rel_paths = "\n".join(
+                f"  {path.relative_to(Path(self.build_lib))}"
+                for path in cpython_extensions
+            )
+            raise SystemExit(
+                "BUDDY_PY_LIMITED_API is set, but the build contains "
+                f"CPython-specific extension modules:\n{rel_paths}\n"
+                "Rebuild LLVM/buddy with MLIR_ENABLE_PYTHON_STABLE_ABI=ON."
+            )
+
+        abi3_extensions = sorted(mlir_libs_dir.glob("*.abi3.so"))
+        if not abi3_extensions:
+            raise SystemExit(
+                "BUDDY_PY_LIMITED_API is set, but no abi3 extension modules "
+                f"were found under {mlir_libs_dir}."
+            )
+
 
 ENTRY_POINTS = {
     "console_scripts": [
@@ -139,16 +166,11 @@ ENTRY_POINTS = {
         "buddy-llc=buddy_tools.cli:buddy_llc",
         "buddy-lsp-server=buddy_tools.cli:buddy_lsp_server",
         "buddy-frontendgen=buddy_tools.cli:buddy_frontendgen",
-        "buddy-audio-container-test=buddy_tools.cli:buddy_audio_container_test",
-        "buddy-text-container-test=buddy_tools.cli:buddy_text_container_test",
-        "buddy-container-test=buddy_tools.cli:buddy_container_test",
+        "buddy-cli=buddy_tools.cli:buddy_cli",
+        "rax-inspect=buddy_tools.cli:rax_inspect",
+        "rax-pack=buddy_tools.cli:rax_pack",
     ]
 }
-
-
-def _resolve_install_requires() -> list[str]:
-    """No hard pin from build env."""
-    return []
 
 
 class build(_build):
@@ -165,6 +187,8 @@ class bdist_wheel(_bdist_wheel):
         super().finalize_options()
         # Force platform-specific wheel since we bundle native libs.
         self.root_is_pure = False
+        if PY_LIMITED_API:
+            self.py_limited_api = PY_LIMITED_API
 
 
 class BinaryDistribution(Distribution):
@@ -180,7 +204,6 @@ setup(
     include_package_data=True,
     cmdclass={"build_py": build_py, "build": build, "bdist_wheel": bdist_wheel},
     distclass=BinaryDistribution,
-    install_requires=_resolve_install_requires(),
     entry_points=ENTRY_POINTS,
     zip_safe=False,
 )

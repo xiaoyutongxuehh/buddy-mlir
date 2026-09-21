@@ -18,20 +18,52 @@
 #
 # ===---------------------------------------------------------------------------
 
+import contextlib
 import ctypes
 import functools
 from enum import Enum, auto
+from pathlib import Path
 from types import FunctionType
+from typing import TYPE_CHECKING
 
 import buddy_mlir.dialects.func as func
 import buddy_mlir.ir as ir
 import numpy as np
+import torch
 from buddy_mlir import runtime as rt
-from buddy_mlir.execution_engine import *
-from buddy_mlir.passmanager import *
+from buddy_mlir.passmanager import PassManager
 
 from .operation import *
 from .type import *
+
+if TYPE_CHECKING:
+    from .structure_analysis import GraphStructureAnalysisResult
+    from .transformer_partition import GraphStructureIndex, TemplateIndex
+
+
+def _replace_node_name(value, old_name, new_name, node_table):
+    if isinstance(value, str):
+        if value == old_name and value in node_table:
+            return new_name
+        return value
+    if isinstance(value, list):
+        return [
+            _replace_node_name(item, old_name, new_name, node_table)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_node_name(item, old_name, new_name, node_table)
+            for item in value
+        )
+    if isinstance(value, dict):
+        return {
+            _replace_node_name(
+                key, old_name, new_name, node_table
+            ): _replace_node_name(item, old_name, new_name, node_table)
+            for key, item in value.items()
+        }
+    return value
 
 
 def make_output_memref_descriptor(ranks, dtypes):
@@ -39,9 +71,9 @@ def make_output_memref_descriptor(ranks, dtypes):
     Make an output memref descriptor for the given memref ranks and dtypes.
 
     Parameters:
-    - ranks: List[int]
+    - ranks: list[int]
         A list of integers representing the ranks of each memref.
-    - dtypes: List[str]
+    - dtypes: list[str]
         A list of strings representing the data types of each memref.
 
     Returns:
@@ -81,11 +113,11 @@ class Graph:
     MLIR module.
 
     Attributes:
-    - _body: List[Op]
+    - _body: list[Op]
         The sequence of operation nodes in the graph.
-    - _inputs: List[TensorMeta]
+    - _inputs: list[TensorMeta]
         The model inputs represented as TensorMeta objects.
-    - _fake_params: List[TensorMeta]
+    - _fake_params: list[TensorMeta]
         The fake parameters represented as TensorMeta objects.
     - device: str
         The hardware for graph runtime.
@@ -111,15 +143,16 @@ class Graph:
         func_name: str,
         device: DeviceType = DeviceType.CPU,
         verbose=False,
+        verbose_path: str | Path | None = None,
         enable_external_calls: bool = False,
     ) -> None:
         """
         Initializes the Graph.
 
         Args:
-            inputs: List[TensorMeta]
+            inputs: list[TensorMeta]
                 The model inputs represented as TensorMeta objects.
-            fake_params: List[TensorMeta]
+            fake_params: list[TensorMeta]
                 The fake parameters represented as TensorMeta objects.
             ops_registry: dict
                 The ops lower strategy for the graph.
@@ -129,22 +162,82 @@ class Graph:
                 Enable external function call support (for oneDNN, etc.)
         """
         self._body = []
+        self._outputs = None
         self._inputs = []
-        self.node_table: Dict[str, Op] = {}
+        self.node_table: dict[str, Op] = {}
         self._fake_params = []
         self.device = device
         self._imported_module = None
+        self._ttir_module = None
+        self._tt_ctx = None
         self._params_ref = None
         self._verbose = verbose
+        self._verbose_path = (
+            Path(verbose_path) if verbose_path is not None else None
+        )
         self._ops_registry = ops_registry
         self._func_name = func_name
         self._ctx = ir.Context()
         self._output_memref = None
         self._output_descriptor = None
         self.execution_engine = None
-        self.op_groups: Dict[str, list[Op]] = {}
-        self.group_map_device: Dict[str, DeviceType] = {}
+        self.op_groups: dict[str, list[Op]] = {}
+        self.group_map_device: dict[str, DeviceType] = {}
         self._enable_external_calls = enable_external_calls
+        self._structure_index: GraphStructureIndex | None = None
+        self._template_index: TemplateIndex | None = None
+
+    @property
+    def structure_index(self) -> "GraphStructureIndex | None":
+        """The cached structural index, or ``None`` before explicit build."""
+        return self._structure_index
+
+    @property
+    def template_index(self) -> "TemplateIndex | None":
+        """The cached layer-template index, or ``None`` before recognition."""
+        return self._template_index
+
+    def analyze_structure(
+        self, enable_template_recognition: bool = False
+    ) -> "GraphStructureAnalysisResult":
+        """Explicitly build and cache structural and optional template indexes."""
+        from .structure_analysis import GraphStructureAnalysisResult
+        from .transformer_partition import RegionBuilder
+
+        if self._structure_index is None:
+            recognizer = None
+            if enable_template_recognition:
+                from .transformer_partition import TemplateRecognizer
+
+                recognizer = TemplateRecognizer()
+            self._structure_index = RegionBuilder(self).build(recognizer)
+            if recognizer is not None:
+                self._template_index = recognizer.finish()
+        elif enable_template_recognition and self._template_index is None:
+            from .transformer_partition import build_template_index
+
+            self._template_index = build_template_index(
+                self, self._structure_index
+            )
+
+        return GraphStructureAnalysisResult(
+            structure_index=self._structure_index,
+            template_index=self._template_index,
+        )
+
+    def build_structure_index(self) -> "GraphStructureIndex":
+        """Build and cache the graph's non-mutating structural description.
+
+        Call this after all frontend graph transforms and before structural
+        planning or lowering. Version one has no automatic invalidation, so the
+        graph must not be mutated in place after this method is called.
+        """
+        return self.analyze_structure().structure_index
+
+    @property
+    def ttir_module(self):
+        """TTIR ``ttmlir.ir.Module`` after ``lower_to_ttir()``; else ``None``."""
+        return self._ttir_module
 
     @property
     def body(self):
@@ -254,7 +347,7 @@ class Graph:
 
         Args:
             node (Op): The operation node to be deleted from the graph.
-            parents (List[Op]): A list of parent operation nodes that reference the node to be deleted.
+            parents (list[Op]): A list of parent operation nodes that reference the node to be deleted.
 
         Returns:
             None
@@ -299,21 +392,37 @@ class Graph:
         newnode._keyword_arguments = node.kwargs
         newnode._tensor_meta = node.tensor_meta
         newnode._op_type = node._op_type
+        newnode.trace_meta = node.trace_meta
+        newnode._source_meta = node._source_meta
 
         for i in node._children:
             newnode.add_children(i)
         users = [self.node_table[i] for i in node._children]
         for user in users:
-            if node.name in user._parents:
-                user._parents[user._parents.index(node.name)] = newnode.name
-            user.args[user.args.index(node.name)] = newnode.name
+            user._arguments = _replace_node_name(
+                user.args, node.name, newnode.name, self.node_table
+            )
+            user._keyword_arguments = _replace_node_name(
+                user.kwargs, node.name, newnode.name, self.node_table
+            )
+            user._parents[:] = [
+                newnode.name if parent == node.name else parent
+                for parent in user._parents
+            ]
         node._children.clear()
         # deal with parents+args
         for i in node._parents:
             newnode.add_parent(i)
-        parents = [self.node_table[i] for i in node._parents]
-        for parent in parents:
-            parent._children[parent._children.index(node.name)] = newnode.name
+
+        # A producer can record this node as a user even when the dependency is
+        # carried in kwargs and is therefore absent from node._parents. Update
+        # every actual reverse use so replacing a consumer cannot leave its old
+        # name dangling in a producer's children list.
+        for producer in self._body:
+            producer._children[:] = [
+                newnode.name if child == node.name else child
+                for child in producer._children
+            ]
         node._parents.clear()
         # update node table
         self._body[self._body.index(node)] = newnode
@@ -336,6 +445,7 @@ class Graph:
         # chain[0] is to be head of the chain:
         chain[0]._arguments = node.args
         chain[0]._keyword_arguments = node.kwargs
+        chain[0].trace_meta = node.trace_meta
         # we do not set the op type, because it might have changed.
 
         for i in node._parents:
@@ -430,12 +540,69 @@ class Graph:
             self.group_map_device[subgraph_name] = DeviceType.CPU
             self.op_groups[subgraph_name] = group
 
+    def infer_graph_inputs(self, op_group: list[Op]) -> list[Op]:
+        """
+        Infer the input operations of a subgraph.
+
+        Args:
+        - op_group (List[Op]): Operations forming a subgraph.
+
+        Returns:
+        - List[Op]: External input operations of the subgraph.
+        """
+        inputs: list[Op] = []
+        op_group_set = set(op_group)
+
+        for op in op_group:
+            for parent_id in op._parents:
+                parent_op = self.node_table[parent_id]
+                if parent_op not in op_group_set and parent_op not in inputs:
+                    inputs.append(parent_op)
+
+        return inputs
+
+    def infer_subgraph_outputs(
+        self,
+        op_group: list[Op],
+        subgraphs_inputs: dict[int, list[Op]],
+        output_nodes: list[Op],
+        dependencies: set,
+    ) -> list[Op]:
+        """
+        Identify the output operations of a subgraph and update its dependencies
+        on other subgraphs.
+
+        Args:
+        - op_group (List[Op]): List of operations forming the subgraph.
+        - subgraphs_inputs (Dict[int, List[Op]]): Mapping from subgraph ID to
+        its input operations.
+        - output_nodes (List[Op]): Operations explicitly marked as output nodes.
+        - dependencies (set): A set to record IDs of subgraphs that consume this
+        subgraph's outputs.
+
+        Returns:
+        - List[Op]: List of operations that are outputs of the subgraph.
+        """
+        outputs: list[Op] = []
+
+        for op in op_group:
+            for subgraph_id, subgraph_inputs in subgraphs_inputs.items():
+                if op in subgraph_inputs:
+                    if op not in outputs:
+                        outputs.append(op)
+                    dependencies.add(subgraph_id)
+
+            if op in output_nodes and op not in outputs:
+                outputs.append(op)
+
+        return outputs
+
     def fuse_ops(self, pattern_list: list[FunctionType]):
         """
         Fuse operations in the graph based on provided fusion patterns.
 
         Args:
-        - pattern_list (List[FunctionType]): A list of functions representing
+        - pattern_list (list[FunctionType]): A list of functions representing
         fusion patterns.
 
         Returns:
@@ -455,7 +622,7 @@ class Graph:
         of functions.
 
         Args:
-        - func_list (List[FunctionType]): A list of functions representing
+        - func_list (list[FunctionType]): A list of functions representing
         transformations to be applied to the graph.
 
         Returns:
@@ -490,10 +657,12 @@ class Graph:
                 False,
                 self.device,
                 verbose=self._verbose,
+                verbose_path=self._verbose_path,
                 enable_external_calls=self._enable_external_calls,
             )
             self._imported_module = fx_importer.import_graph()
             outputs = fx_importer.get_output_nodes()
+            self._outputs = outputs
         self._output_memref = []
         output_ranks = []
         output_dtypes = []
@@ -540,6 +709,39 @@ class Graph:
             output_ranks, output_dtypes
         )
 
+    def lower_to_ttir(
+        self,
+        ops_registry=None,
+        *,
+        element_dtype: str = "bf16",
+    ):
+        """
+        Lower the graph to a TTIR MLIR module using the ``ttmlir`` Python bindings.
+
+        Does not populate ``self._imported_module`` (Buddy/TOSA/etc.); the result
+        is stored in ``self._ttir_module``. Requires ``ttmlir`` on ``PYTHONPATH``.
+
+        Args:
+            ops_registry: Like ``tosa.ops_registry``; defaults to
+                ``buddy.compiler.ops.ttir.ops_registry``.
+            element_dtype: ``"bf16"`` (default) or ``"f32"`` for tensor types.
+        """
+        from ..ops.ttir import ops_registry as default_ttir_registry
+        from .ttir_import import build_ttir_module_for_graph
+
+        reg = (
+            ops_registry if ops_registry is not None else default_ttir_registry
+        )
+        self._ttir_module, self._tt_ctx = build_ttir_module_for_graph(
+            self._body,
+            self.params_shapes,
+            self.inputs_shapes,
+            self._func_name,
+            reg,
+            verbose=self._verbose,
+            element_dtype=element_dtype,
+        )
+
     def lower_to_llvm_ir(self):
         """
         Lower graph to llvm ir.
@@ -578,6 +780,7 @@ class Graph:
             pm.add("cse")
             pm.add("memref-expand")
             pm.add("arith-expand")
+            pm.add("convert-bufferization-to-memref")
             pm.add("convert-vector-to-llvm")
             pm.add("convert-complex-to-llvm")
             pm.add("convert-arith-to-llvm")
@@ -607,9 +810,9 @@ class GraphImporter:
 
     Attributes:
         _symbol_table (dict): A dictionary to keep track of the symbols.
-        _body (List[Op]): The FX graph module to be imported.
+        _body (list[Op]): The FX graph module to be imported.
         _func_name (str): Name of the generated MLIR function.
-        _inputs (List[TensorMeta]): Input tensor(s) of the FX graph.
+        _inputs (list[TensorMeta]): Input tensor(s) of the FX graph.
         _num_input_visited (int): Number of input nodes that have been visited.
         _module (buddy_mlir.ir.Module): The generated MLIR module.
         _ops_registry (dict): Registry for the candidate operations.
@@ -625,6 +828,7 @@ class GraphImporter:
         do_param_pack: bool = False,
         device: DeviceType = DeviceType.CPU,
         verbose=False,
+        verbose_path: str | Path | None = None,
         enable_external_calls: bool = False,
     ):
         """
@@ -632,7 +836,7 @@ class GraphImporter:
 
         Args:
             gm (Graph): The buddy graph that will be imported.
-            inputs (List[TensorMeta]): Input tensor(s) of the buddy graph.
+            inputs (list[TensorMeta]): Input tensor(s) of the buddy graph.
             func_name (str): Name of the generated MLIR function.
             ops_registry (dict): Registry for the candidate operations.
             enable_external_calls (bool): Enable external function call support (for oneDNN, etc.)
@@ -640,19 +844,51 @@ class GraphImporter:
         if ops_registry is None:
             ops_registry = {}
         self._symbol_table = {}
+        self._symbol_table_output = {}
         self._body = body
         self._device = device
         self._func_name = func_name
         self._params_shapes = params_shapes
         self._inputs_shapes = inputs_shapes
         self._verbose = verbose
+        self._verbose_path = (
+            Path(verbose_path) if verbose_path is not None else None
+        )
         self._do_param_pack = do_param_pack
         self._param_packs = []
         self._num_input_visited = 0
         self._module = ir.Module.create()
+        self._module.context.allow_unregistered_dialects = True
         self._ops_registry = ops_registry
         self._current_param_pack_offset = None
         self._enable_external_calls = enable_external_calls
+
+    def _verbose_output(self):
+        if self._verbose_path is None:
+            return contextlib.nullcontext()
+        self._verbose_path.parent.mkdir(parents=True, exist_ok=True)
+        return self._verbose_path.open("a")
+
+    def _print_verbose_node(self, node: Op, old_ops: list, new_ops: list):
+        old_op_set = set(old_ops)
+        with self._verbose_output() as stream:
+            ctx = (
+                contextlib.redirect_stdout(stream)
+                if stream
+                else contextlib.nullcontext()
+            )
+            with ctx:
+                print("=" * 20 + "Graph Node" + "=" * 20)
+                print("Node: " + node.name)
+                print("Type: " + str(node._op_type))
+                print("Arguments: " + str(node.args))
+                print("Parents: " + str(node._parents))
+                print("Children: " + str(node._children))
+                print("-" * 20 + "MLIR OPS" + "-" * 20)
+                for op in new_ops:
+                    if op not in old_op_set:
+                        print(op)
+                print("")
 
     def _str_to_mlir_dtype(self, dtype: str) -> ir.Type:
         """
@@ -761,26 +997,15 @@ class GraphImporter:
                     elif isinstance(node, PlaceholderOp):
                         self._import_placeholder(node, args_list)
                     elif isinstance(node, GetItemOp):
-                        self._symbol_table[(str(node.name), 0)] = (
-                            self._symbol_table[
-                                (str(node.args[0]), node.args[1])
-                            ]
-                        )
+                        value = self._symbol_table[
+                            (str(node.args[0]), node.args[1])
+                        ]
+                        self._symbol_table[(str(node.name), 0)] = value
                     else:
                         self._import_op(node)
                     new_ops = [op for op in func_op.body.blocks[0].operations]
                     if self._verbose:
-                        print("=" * 20 + "Graph Node" + "=" * 20)
-                        print("Node: " + node.name)
-                        print("Type: " + str(node._op_type))
-                        print("Arguments: " + str(node.args))
-                        print("Parents: " + str(node._parents))
-                        print("Children: " + str(node._children))
-                        print("-" * 20 + "MLIR OPS" + "-" * 20)
-                        for op in new_ops:
-                            if op not in old_ops:
-                                print(op)
-                        print("")
+                        self._print_verbose_node(node, old_ops, new_ops)
 
                 return self._symbol_table.get(("output", 0))
 
@@ -836,13 +1061,16 @@ class GraphImporter:
                         ]
                         self._symbol_table[("output", 0)] = returns
                     elif isinstance(node, PlaceholderOp):
+                        if node._newshape is not None:
+                            node.tensor_meta["shape"] = torch.Size(
+                                list(node._newshape)
+                            )
                         self._import_placeholder(node, args_list)
                     elif isinstance(node, GetItemOp):
-                        self._symbol_table[(str(node.name), 0)] = (
-                            self._symbol_table[
-                                (str(node.args[0]), node.args[1])
-                            ]
-                        )
+                        value = self._symbol_table[
+                            (str(node.args[0]), node.args[1])
+                        ]
+                        self._symbol_table[(str(node.name), 0)] = value
                     else:
                         self._import_op(node)
 
@@ -859,7 +1087,7 @@ class GraphImporter:
         Parameters:
         - node (PlaceholderOp): The PlaceholderOp node representing the
         placeholder.
-        - args_list (List[buddy_mlir.ir.BlockArgument]): List of input memrefs.
+        - args_list (list[buddy_mlir.ir.BlockArgument]): list of input memrefs.
 
         Returns:
         None
@@ -915,7 +1143,7 @@ class GraphImporter:
 
         # Build argument types from CallOp's arguments
         arg_types = []
-        for i, arg in enumerate(call_node.args):
+        for _, arg in enumerate(call_node.args):
             # Get the node that produces this argument
             arg_node = None
             for node in self._body:
@@ -986,23 +1214,30 @@ class GraphImporter:
         op_ret: ir.Operation | ir.Value | tuple | list | ir.OpResult = (
             self._ops_registry[op_name](node, self._symbol_table)
         )
+
         if isinstance(op_ret, tuple | list | ir.OpResultList):
             for i, operation in enumerate(op_ret):
                 if isinstance(operation, ir.Operation) or isinstance(
                     operation, ir.OpView
                 ):
                     self._symbol_table[(str(node.name), i)] = operation.result
+                    self._symbol_table_output[(str(node.name), i)] = (
+                        operation.result
+                    )
                 elif isinstance(operation, ir.OpResult):
                     self._symbol_table[(str(node.name), i)] = operation
+                    self._symbol_table_output[(str(node.name), i)] = operation
                 else:
                     raise NotImplementedError
-        elif isinstance(op_ret, ir.OpResult) or isinstance(
-            op_ret, ir.BlockArgument
-        ):
+        elif isinstance(op_ret, ir.OpResult):
+            self._symbol_table[(str(node.name), 0)] = op_ret
+            self._symbol_table_output[(str(node.name), 0)] = op_ret
+        elif isinstance(op_ret, ir.BlockArgument):
             self._symbol_table[(str(node.name), 0)] = op_ret
         else:
             for i, result in enumerate(op_ret.results):
                 self._symbol_table[(str(node.name), i)] = result
+                self._symbol_table_output[(str(node.name), i)] = result
 
     def get_output_nodes(self):
         """

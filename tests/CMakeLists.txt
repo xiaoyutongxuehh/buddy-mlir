@@ -11,6 +11,7 @@ set(BUDDY_TEST_DEPENDS
   FileCheck count not
   buddy-opt
   buddy-translate
+  buddy-llc
   buddy-container-test
   buddy-audio-container-test
   buddy-text-container-test
@@ -28,8 +29,11 @@ if(BUDDY_MLIR_ENABLE_DIP_LIB)
   endif()
 endif()
 
+if(MLIR_ENABLE_BINDINGS_PYTHON)
+  list(APPEND BUDDY_TEST_DEPENDS python-package-buddy)
+endif()
 if(BUDDY_MLIR_ENABLE_PYTHON_PACKAGES)
-  list(APPEND BUDDY_TEST_DEPENDS python-package-buddy-mlir)
+  list(APPEND BUDDY_TEST_DEPENDS python-package-buddy-mlir python-package-buddy)
 endif()
 
 add_lit_testsuite(check-tests "Running the buddy regression tests..."
@@ -38,7 +42,13 @@ add_lit_testsuite(check-tests "Running the buddy regression tests..."
   )
 set_target_properties(check-tests PROPERTIES FOLDER "Tests")
 
-add_lit_testsuites(BUDDY ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${BUDDY_TEST_DEPENDS})
+# BINARY_DIR lets the per-directory check-buddy-* targets run lit on the build
+# tree with --filter=<subdir>. Pointing lit at the source tree instead makes it
+# load lit.cfg.py without the generated lit.site.cfg.py in front of it, and that
+# config dies on config.buddy_mlir_enable_python_packages.
+add_lit_testsuites(BUDDY ${CMAKE_CURRENT_SOURCE_DIR}
+  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${BUDDY_TEST_DEPENDS})
 
 #------------------------------------------------------------------------------------
 #    E2E test module
@@ -60,6 +70,7 @@ if(BUDDY_ENABLE_E2E_TESTS)
   mlir-runner
   buddy-lenet-run-test-cpu
   python-package-buddy
+  python-package-buddy-mlir
   )
 
   add_lit_testsuite(check-e2e "Running E2E tests for Models directory..."
@@ -68,6 +79,8 @@ if(BUDDY_ENABLE_E2E_TESTS)
     )
   set_target_properties(check-e2e PROPERTIES FOLDER "Tests")
 
-  add_lit_testsuites(BUDDY_MODELS ${CMAKE_CURRENT_SOURCE_DIR}/Models DEPENDS ${BUDDY_MODELS_TEST_DEPENDS})
+  add_lit_testsuites(BUDDY_MODELS ${CMAKE_CURRENT_SOURCE_DIR}/Models
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/Models
+    DEPENDS ${BUDDY_MODELS_TEST_DEPENDS})
 
 endif()

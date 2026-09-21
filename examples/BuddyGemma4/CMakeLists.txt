@@ -17,24 +17,21 @@ if(IS_RVV_PLATFORM)
   set(RISCV_LINK_OPTS "-march=rv64gcv;-mabi=lp64d")
 else()
   set(OPENMP_NUM_THREADS "num-threads=48")
-  set(LLC_RISCV_ATTRS "")
+  set(LLC_RISCV_ATTRS "-mcpu=native")
 endif()
 
-# Skip import commands on RVV platform
-if(NOT IS_RVV_PLATFORM)
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_e2b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_e2b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_e2b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_e2b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0_e2b.data
-           ${CMAKE_CURRENT_BINARY_DIR}/vocab.txt
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-gemma4.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-            --precision f32
-    COMMENT "Generating Gemma4-E2B MLIR and data files..."
-  )
-endif()
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_e2b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_e2b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_e2b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_e2b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0_e2b.data
+          ${CMAKE_CURRENT_BINARY_DIR}/vocab.txt
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-gemma4.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --precision f32
+  COMMENT "Generating Gemma4-E2B MLIR and data files..."
+)
 
 add_custom_command(
   OUTPUT forward_prefill_e2b.o
@@ -229,7 +226,7 @@ add_custom_command(
             -reconcile-unrealized-casts |
           ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
           ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
-          ${LLVM_TOOLS_BINARY_DIR}/llc -filetype=obj -relocation-model=pic -O3
+          ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
             -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode_e2b.o
     DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_e2b.mlir
     COMMENT "Building subgraph_decode_e2b.o"
@@ -274,6 +271,19 @@ if(BUDDY_MLIR_USE_MIMALLOC)
 endif()
 
 target_link_libraries(buddy-gemma4-e2b-run ${BUDDY_GEMMA4_E2B_LIBS})
+
+add_test(
+  NAME example.buddy-gemma4-e2b-run
+  COMMAND sh -c "printf '%s\n' 'Hi' | \"$<TARGET_FILE:buddy-gemma4-e2b-run>\""
+  WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+set_tests_properties(
+  example.buddy-gemma4-e2b-run
+  PROPERTIES
+    LABELS "example"
+    PASS_REGULAR_EXPRESSION "Hi! How can I's how can you?"
+    TIMEOUT 3600
+)
 
 # Create a distributable package
 set(DIST_PACKAGE_NAME "buddy-gemma4-e2b")

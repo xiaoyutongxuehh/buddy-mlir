@@ -1,0 +1,97 @@
+name: LLVM Upgrade (SyncBots)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_llvm:
+        description: "Target LLVM commit hash (blank = main HEAD)"
+        required: false
+        default: ""
+      max_iterations:
+        description: "Max fix iterations"
+        required: false
+        default: "0"
+      strong_model:
+        description: "Strong model (main agent)"
+        required: false
+        default: "gpt-5.6-sol"
+      weak_model:
+        description: "Weak model (subagents, blank = same as strong)"
+        required: false
+        default: ""
+
+jobs:
+  upgrade:
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Init required submodules only
+        run: |
+          git submodule update --init llvm
+          git submodule update --init thirdparty/mimalloc
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir --force-reinstall git+https://github.com/RuyiAI-Stack/SyncBots-DeepAgents.git@main
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Generate LLM config
+        run: |
+          cat > llm_config.yaml << 'EOF'
+          default:
+            provider: ${{ secrets.LLM_PROVIDER || 'openai_compatible' }}
+            model: ${{ github.event.inputs.strong_model || 'gpt-5.6-sol' }}
+            api_key: ${{ secrets.LLM_API_KEY }}
+            base_url: ${{ secrets.LLM_BASE_URL || '' }}
+          strong_model: ${{ github.event.inputs.strong_model || 'gpt-5.6-sol' }}
+          weak_model: ${{ github.event.inputs.weak_model || '' }}
+          github_token: ${{ secrets.PAT_TOKEN || github.token }}
+          EOF
+
+      - name: Run LLVM upgrade agent
+        run: |
+          syncbots upgrade-single \
+            --repo buddy-mlir \
+            --repo-path . \
+            --target-llvm "${{ github.event.inputs.target_llvm }}" \
+            --max-iterations ${{ github.event.inputs.max_iterations || '10' }} \
+            --llm-config llm_config.yaml \
+            --output-dir "${{ runner.temp }}/syncbots-output" \
+            --auto-branch --branch-base main
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Upload agent logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncbots-logs
+          path: ${{ runner.temp }}/syncbots-output/
+          retention-days: 30
+
+      - name: Create Pull Request
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+          branch: syncbots/llvm-upgrade-${{ github.run_id }}
+          title: "[LLVM] Automated upgrade by SyncBots"
+          body: |
+            Automated LLVM upgrade by [SyncBots-DeepAgents](https://github.com/RuyiAI-Stack/SyncBots-DeepAgents).
+
+            - Target LLVM: `${{ github.event.inputs.target_llvm || 'main HEAD' }}`
+            - Model: `${{ github.event.inputs.strong_model || 'gpt-5.6-sol' }}`
+            - Max iterations: ${{ github.event.inputs.max_iterations || '10' }}
+          commit-message: "[LLVM] Automated upgrade to ${{ github.event.inputs.target_llvm || 'latest' }}"

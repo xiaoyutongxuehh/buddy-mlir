@@ -202,7 +202,7 @@ def count_params(spec: dict) -> dict:
             "    1. Install torch: pip install torch\n"
             "    2. Add weights_override to your spec JSON, e.g.:\n"
             '       "weights_override": {"total": 1777088064}'
-        )
+        ) from None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -223,23 +223,11 @@ def compute_weights(variant: str, param_counts: dict) -> list[dict]:
 
         if variant in ("f32", "f16", "bf16"):
             num_elements = param_counts["total"]
-        elif variant in ("w8a32", "w8a16"):
-            if etype == "i8":
-                num_elements = param_counts["linear_elements"]
-            else:
-                num_elements = (
-                    param_counts["other_elements"]
-                    + param_counts["linear_output_channels"]
-                )
-        elif variant == "w8a8":
-            if etype == "i8":
-                num_elements = param_counts["linear_elements"]
-            else:
-                num_elements = (
-                    param_counts["other_elements"]
-                    + param_counts["linear_output_channels"]
-                )
-        elif variant == "w4a16":
+        elif (
+            variant in ("w8a32", "w8a16")
+            or variant == "w8a8"
+            or variant == "w4a16"
+        ):
             if etype == "i8":
                 num_elements = param_counts["linear_elements"]
             else:
@@ -265,6 +253,33 @@ def compute_weights(variant: str, param_counts: dict) -> list[dict]:
     return weights
 
 
+def derive_tiered_kv_cache(spec: dict) -> dict:
+    """Return tiered KV cache settings from the variant spec."""
+    raw = spec.get("tiered_kv_cache", False)
+    if isinstance(raw, dict):
+        enabled = bool(raw.get("enabled", True))
+        cache_sizes = raw.get("cache_sizes", spec.get("cache_sizes", []))
+    else:
+        enabled = bool(raw)
+        cache_sizes = spec.get("cache_sizes", [])
+
+    if not enabled:
+        return {"enabled": False, "cache_sizes": []}
+
+    if isinstance(cache_sizes, str):
+        cache_sizes = [
+            int(x.strip()) for x in cache_sizes.split(",") if x.strip()
+        ]
+    else:
+        cache_sizes = [int(x) for x in cache_sizes]
+
+    if not cache_sizes:
+        cache_sizes = [32, 64, 128, 256, 512, 1024]
+
+    cache_sizes = sorted(dict.fromkeys(cache_sizes))
+    return {"enabled": True, "cache_sizes": cache_sizes}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Shape / token derivation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,6 +296,42 @@ def derive_shapes(hf: dict, spec: dict) -> dict:
         "vocab_size": hf["vocab_size"],
         "max_token_len": spec.get("max_token_len", 1024),
         "num_hidden_layers": hf["num_hidden_layers"],
+    }
+
+
+def derive_decode_pack(hf: dict, spec: dict) -> dict:
+    """Opt-in panel-packing of the decode matmul weights (see the
+    pack_decode_matmul_weights graph transform). Off unless the spec sets
+    `decode_pack_vector_size`, so existing specs are unaffected.
+
+    When on, import_model.py runs the pack_decode_matmul_weights graph
+    transform over the decode graph -- rewriting every matmul weight into
+    N-tile panel layout -- and writes decode's parameters to their own file.
+    compile_pipeline.py then compiles decode with
+    -matmul-vectorization-decode-packed instead of the plain row-major kernel.
+
+    Decode needs its own file because the two phases want opposite layouts:
+    decode is a GEMV that reads each weight byte once (so the layout is what
+    limits it), prefill is compute-bound and its matmul kernel expects plain
+    row-major B. Handing prefill the packed bytes does not fail loudly; it just
+    reads them as row-major and produces fluent, wrong output.
+
+    Packing is a permutation of each weight's bytes: same shape, same offsets,
+    same element count. So this is not an extra weight blob -- it is the same
+    blob with a second file, and the only thing that differs between the phases
+    is which of the two they are handed.
+    """
+    vecsize = spec.get("decode_pack_vector_size")
+    if not vecsize:
+        return {"enabled": False}
+
+    return {
+        "enabled": True,
+        "vector_size": vecsize,
+        # Divisibility of every weight's N by vecsize is checked by the graph
+        # transform, which is the only thing that knows the full weight set --
+        # it covers lm_head and the attention projections, not just the FFN.
+        "decode_file": "arg0-decode.data",
     }
 
 
@@ -310,13 +361,54 @@ def gen_config(spec: dict, hf_config_path: str | None = None) -> dict:
     precision = VARIANT_PRECISION.get(variant, VARIANT_PRECISION["f32"])
     param_counts = count_params(spec)
     weights = compute_weights(variant, param_counts)
+    tiered_kv_cache = derive_tiered_kv_cache(spec)
+    decode_pack = derive_decode_pack(hf, spec)
+    if decode_pack["enabled"] and variant not in ("f32", "f16", "bf16"):
+        raise RuntimeError(
+            f"decode_pack_vector_size is only supported for f32/f16/bf16 "
+            f"variants (got variant={variant!r})"
+        )
+    if decode_pack["enabled"] and tiered_kv_cache["enabled"]:
+        # Refuse here rather than at import time: only gen_impl was taught to
+        # hand decode a different weight buffer, so gen_impl_tiered would
+        # silently give decode the plain weights and compile it with the packed
+        # kernel -- fluent, wrong output, nothing to catch it.
+        raise RuntimeError(
+            "decode_pack_vector_size is not supported together with "
+            "tiered_kv_cache"
+        )
+    if decode_pack["enabled"]:
+        # Not a second blob: the same blob with a second file. weights[0]
+        # ("file") stays plain for prefill; decode is handed "decode_file".
+        weights[0]["decode_file"] = decode_pack["decode_file"]
+
+    if tiered_kv_cache["enabled"]:
+        if variant != "f32":
+            raise RuntimeError(
+                "tiered_kv_cache is currently implemented for the f32 "
+                "DeepSeek R1 variant only."
+            )
+        if tiered_kv_cache["cache_sizes"][-1] != shape["max_token_len"]:
+            raise RuntimeError(
+                "The largest tiered KV cache size must equal max_token_len "
+                f"({shape['max_token_len']}); got "
+                f"{tiered_kv_cache['cache_sizes'][-1]}."
+            )
+        # Keep compatibility with the legacy tiered example artifact name.
+        if len(weights) == 1:
+            weights[0]["file"] = spec.get("weights_file", "arg0_mc.data")
 
     kv_type = precision["kv_type"]
+    model_id = f"{model_family}_{variant}"
+    if tiered_kv_cache["enabled"]:
+        model_id = f"{model_id}_tiered_kv_cache"
+    if decode_pack["enabled"]:
+        model_id = f"{model_id}_packed_ffn"
 
     return {
         "model_family": model_family,
         "variant": variant,
-        "model_id": f"{model_family}_{variant}",
+        "model_id": model_id,
         "hf_model_path": spec["hf_model_path"],
         "architecture": (
             hf["architectures"][0]
@@ -327,11 +419,13 @@ def gen_config(spec: dict, hf_config_path: str | None = None) -> dict:
         "precision": precision,
         "weights": weights,
         "tokens": tokens,
+        "tiered_kv_cache": tiered_kv_cache,
+        "decode_pack": decode_pack,
         "cpp_types": {
             "kv": ELEMENT_TYPE_CPP[kv_type],
             "logits": ELEMENT_TYPE_CPP[precision["logits_type"]],
             "kv_memref": f"MemRef<{ELEMENT_TYPE_CPP[kv_type]}, 4>",
-            "logits_memref": f'MemRef<{ELEMENT_TYPE_CPP[precision["logits_type"]]}, 3>',
+            "logits_memref": f"MemRef<{ELEMENT_TYPE_CPP[precision['logits_type']]}, 3>",
         },
         "mlir_types": {
             "kv": ELEMENT_TYPE_MLIR[kv_type],

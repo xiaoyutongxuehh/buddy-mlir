@@ -1,7 +1,7 @@
 [submodule "llvm"]
 	path = llvm
-	url = https://github.com/llvm/llvm-project.git
-	branch = main
+	url = https://github.com/RuyiAI-Stack/llvm-project
+	branch = riscv
 	shallow = true
 [submodule "thirdparty/mimalloc"]
 	path = thirdparty/mimalloc
@@ -10,4 +10,8 @@
 [submodule "thirdparty/riscv-gnu-toolchain"]
 	path = thirdparty/riscv-gnu-toolchain
 	url = https://github.com/riscv-collab/riscv-gnu-toolchain.git
+	shallow = false
+[submodule "thirdparty/tt-mlir"]
+	path = thirdparty/tt-mlir
+	url = https://github.com/tenstorrent/tt-mlir.git
 	shallow = false

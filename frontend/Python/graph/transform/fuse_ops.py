@@ -22,6 +22,8 @@ from torch.fx.immutable_collections import immutable_list
 
 from .. import DeviceType, Graph
 from ..operation import (
+    AddMMOp,
+    AddOp,
     CloneOp,
     ExpandOp,
     FlashAttentionForCpuPrefillOp,
@@ -36,6 +38,7 @@ from ..operation import (
     UnsqueezeOp,
     ViewOp,
 )
+from ..source_meta import merge_source_meta
 
 classicfuse_register = {
     "transpose_matmul_fusion": TransposeMatmulFusedOp,
@@ -50,6 +53,138 @@ classicfuse_register = {
 # OP_TYPE_UNFUSABLE = [OpType.Unfusable, OpType.ConcatType]
 # OP_TYPE_FUSABLE_BY_SPECIFIC_PASS = []
 # ANCHOR_OP_TYPE = []
+
+
+def decompose_addmm_to_mm_add(graph: Graph):
+    """
+    Decompose:
+
+        addmm(bias, lhs, rhs)
+
+    into:
+
+        mm(lhs, rhs)
+        add(bias, mm)
+
+    This enables the existing classic_fuse_check() to further fuse:
+
+        mm(lhs, permute(weight))
+
+    into:
+
+        fusedmm(lhs, weight)
+
+    Finally the lowered MLIR becomes:
+
+        linalg.matmul_transpose_b + tosa.add
+    """
+
+    for node in list(graph.body):
+        if not isinstance(node, AddMMOp):
+            continue
+
+        # AddMMOp arguments should be:
+        #   args[0] = bias
+        #   args[1] = lhs
+        #   args[2] = rhs
+        #
+        # Expected argument structure: [bias, lhs, rhs]
+        if len(node.args) < 3:
+            continue
+
+        bias_name = str(node.args[0])
+        lhs_name = str(node.args[1])
+        rhs_name = str(node.args[2])
+
+        if bias_name not in graph.node_table:
+            continue
+        if lhs_name not in graph.node_table:
+            continue
+        if rhs_name not in graph.node_table:
+            continue
+
+        bias_node = graph.node_table[bias_name]
+        lhs_node = graph.node_table[lhs_name]
+        rhs_node = graph.node_table[rhs_name]
+
+        # Be conservative: only decompose addmm whose rhs is permute(weight, [1, 0]).
+        # This targets the MHA Q/K/V pattern:
+        #   addmm(bias, x, permute(W))
+        if not isinstance(rhs_node, PermuteOp):
+            continue
+        if len(rhs_node.args) < 2:
+            continue
+        if rhs_node.args[1] != immutable_list([1, 0]):
+            continue
+
+        # Create:
+        #   mm(lhs, rhs)
+        mm_node = MatmulOp()
+        mm_node.name = node.name + "_decomposed_mm"
+        mm_node._arguments = [lhs_name, rhs_name]
+        mm_node._parents = [lhs_name, rhs_name]
+        mm_node._children = [node.name]
+        mm_node.tensor_meta = node.tensor_meta.copy()
+        mm_node._source_meta = node._source_meta
+
+        # Create:
+        #   add(bias, mm)
+        #
+        # Reuse the original addmm name for the AddOp.
+        # This avoids changing downstream users such as view_5.
+        add_node = AddOp()
+        add_node.name = node.name
+        add_node._arguments = [bias_name, mm_node.name]
+        add_node._parents = [bias_name, mm_node.name]
+        add_node._children = list(node._children)
+        add_node.tensor_meta = node.tensor_meta.copy()
+        add_node._source_meta = node._source_meta
+
+        # Replace original AddMMOp in graph.body with:
+        #   mm_node
+        #   add_node
+        idx = graph.body.index(node)
+        graph.body[idx] = mm_node
+        graph.body.insert(idx + 1, add_node)
+
+        # Update node_table.
+        graph.node_table[mm_node.name] = mm_node
+        graph.node_table[add_node.name] = add_node
+
+        # Update lhs children:
+        #   lhs: addmm -> addmm_decomposed_mm
+        if node.name in lhs_node._children:
+            lhs_node._children.remove(node.name)
+        if mm_node.name not in lhs_node._children:
+            lhs_node._children.append(mm_node.name)
+
+        # Update rhs children:
+        #   permute: addmm -> addmm_decomposed_mm
+        if node.name in rhs_node._children:
+            rhs_node._children.remove(node.name)
+        if mm_node.name not in rhs_node._children:
+            rhs_node._children.append(mm_node.name)
+
+        # Bias still feeds the node named "addmm", but that node is now AddOp.
+        if node.name not in bias_node._children:
+            bias_node._children.append(node.name)
+
+        # Downstream children still reference "addmm".
+        # Since add_node reuses node.name, usually no change is needed.
+        # Keep this normalization for safety.
+        for child_name in add_node._children:
+            if child_name not in graph.node_table:
+                continue
+
+            child_node = graph.node_table[child_name]
+
+            for i, arg in enumerate(child_node.args):
+                if str(arg) == node.name:
+                    child_node.args[i] = add_node.name
+
+            for i, parent_name in enumerate(child_node._parents):
+                if parent_name == node.name:
+                    child_node._parents[i] = add_node.name
 
 
 def classic_fuse_check(graph: Graph):
@@ -94,9 +229,17 @@ def transpose_matmul_fusion(
     - None: Modifies the input graph in place.
     """
     fused_op = classicfuse_register.get(pattern)()
+    original_order = {op: index for index, op in enumerate(graph.body)}
+    absorbed = [node]
+    if target._children == [node.name]:
+        absorbed.append(target)
+    fused_source_meta = merge_source_meta(
+        *(op._source_meta for op in sorted(absorbed, key=original_order.get))
+    )
     # matmulop -> fusedmatmulopnode
     fused_op.name = "fused" + node.name
     graph.displace_node(node, fused_op)
+    fused_op._source_meta = fused_source_meta
     fused_op.args.pop(fused_op.args.index(target.name))
     fused_op._parents.pop(fused_op._parents.index(target.name))
     fused_op.args.extend(target.args)
@@ -125,6 +268,7 @@ def apply_classic_fusion(graph: Graph):
     new_op_group = []
     device = DeviceType.CPU
     # Run the first round of op fusion
+    decompose_addmm_to_mm_add(graph)
     classic_fuse_check(graph)
     for op in graph.body:
         if isinstance(op, PlaceholderOp):
@@ -179,12 +323,14 @@ def replace_attention_op(graph: Graph):
     Replace ScaledDotProductFlashAttentionForCpuOp with
     FlashAttentionForCpuPrefillOp.
     """
+    cnt = 1
     for op in list(graph.body):
         if isinstance(op, ScaledDotProductFlashAttentionForCpuOp):
             new_op = classicfuse_register.get(
                 "flash_attention_prefill_fusion"
             )()
-            new_op.name = "FlashAttentionForCpuPrefillOp"
+            new_op.name = f"FlashAttentionForCpuPrefillOp_{cnt}"
+            cnt += 1
             graph.displace_node(op, new_op)
 
 
@@ -212,67 +358,76 @@ def gqa_attention_fusion(graph: Graph):
 
 
 def gqa_attention_fusion_check(graph: Graph):
+    """Detect GQA SDPA + KV-cache-update subgraph and fuse it.
+
+    Two equivalent KV-write patterns are relevant for LLMs:
+
+    1. ``View <- Clone <- Expand <- Unsqueeze <- IndexPut`` from the native
+       static-cache lowering.
+    2. ``View <- Clone <- Expand <- Unsqueeze <- Where`` from the transformer
+       StaticCache monkey-patch used while aten index-copy support catches up.
+
+    Only the IndexPut path is enabled here. The Where path is graph-equivalent,
+    but on Tenstorrent it currently lowers to a TTNN decode kernel that can hit
+    an SFPI compiler issue. Re-enable it once the backend side is fixed.
+    """
+    cnt = 1
     for op in graph.body:
         # === GQA Attention pattern ===
-        if isinstance(op, ScaledDotProductFlashAttentionForCpuOp):
-            # get KV and View nodes
-            k_view_node = graph.node_table.get(op._parents[1], None)
-            v_view_node = graph.node_table.get(op._parents[2], None)
+        if not isinstance(op, ScaledDotProductFlashAttentionForCpuOp):
+            continue
 
-            if not (
-                isinstance(k_view_node, ViewOp)
-                and isinstance(v_view_node, ViewOp)
-            ):
-                continue
+        k_view_node = graph.node_table.get(op._parents[1], None)
+        v_view_node = graph.node_table.get(op._parents[2], None)
+        if not (
+            isinstance(k_view_node, ViewOp) and isinstance(v_view_node, ViewOp)
+        ):
+            continue
 
-            # trace Key branch for torch2.10:
-            # View <- Clone <- Expand <- Unsqueeze <- IndexPut
-            k_clone = graph.node_table.get(k_view_node._parents[0], None)
-            if not isinstance(k_clone, CloneOp):
-                continue
-            k_expand = graph.node_table.get(k_clone._parents[0], None)
-            if not isinstance(k_expand, ExpandOp):
-                continue
-            k_cache_unsqueeze = graph.node_table.get(k_expand._parents[0], None)
-            if not isinstance(k_cache_unsqueeze, UnsqueezeOp):
-                continue
-            k_index_put = graph.node_table.get(
-                k_cache_unsqueeze._parents[0], None
-            )
-            if not isinstance(k_index_put, IndexPutOp):
-                continue
+        # Key branch: View <- Clone <- Expand <- Unsqueeze <- IndexPut
+        k_clone = graph.node_table.get(k_view_node._parents[0], None)
+        if not isinstance(k_clone, CloneOp):
+            continue
+        k_expand = graph.node_table.get(k_clone._parents[0], None)
+        if not isinstance(k_expand, ExpandOp):
+            continue
+        k_cache_unsqueeze = graph.node_table.get(k_expand._parents[0], None)
+        if not isinstance(k_cache_unsqueeze, UnsqueezeOp):
+            continue
+        k_index_put = graph.node_table.get(k_cache_unsqueeze._parents[0], None)
+        if not isinstance(k_index_put, IndexPutOp):
+            continue
 
-            # trace Value branch for torch2.10:
-            # View <- Clone <- Expand <- Unsqueeze <- IndexPut
-            v_clone = graph.node_table.get(v_view_node._parents[0], None)
-            if not isinstance(v_clone, CloneOp):
-                continue
-            v_expand = graph.node_table.get(v_clone._parents[0], None)
-            if not isinstance(v_expand, ExpandOp):
-                continue
-            v_cache_unsqueeze = graph.node_table.get(v_expand._parents[0], None)
-            if not isinstance(v_cache_unsqueeze, UnsqueezeOp):
-                continue
-            v_index_put = graph.node_table.get(
-                v_cache_unsqueeze._parents[0], None
-            )
-            if not isinstance(v_index_put, IndexPutOp):
-                continue
-            replace_gqa_attention_with_fused_op(
-                graph,
-                op,
-                k_view_node,
-                k_clone,
-                k_expand,
-                k_cache_unsqueeze,
-                k_index_put,
-                v_view_node,
-                v_clone,
-                v_expand,
-                v_cache_unsqueeze,
-                v_index_put,
-                "gqa_attention_fusion",
-            )
+        # Value branch: View <- Clone <- Expand <- Unsqueeze <- IndexPut
+        v_clone = graph.node_table.get(v_view_node._parents[0], None)
+        if not isinstance(v_clone, CloneOp):
+            continue
+        v_expand = graph.node_table.get(v_clone._parents[0], None)
+        if not isinstance(v_expand, ExpandOp):
+            continue
+        v_cache_unsqueeze = graph.node_table.get(v_expand._parents[0], None)
+        if not isinstance(v_cache_unsqueeze, UnsqueezeOp):
+            continue
+        v_index_put = graph.node_table.get(v_cache_unsqueeze._parents[0], None)
+        if not isinstance(v_index_put, IndexPutOp):
+            continue
+        replace_gqa_attention_with_fused_op(
+            graph,
+            op,
+            k_view_node,
+            k_clone,
+            k_expand,
+            k_cache_unsqueeze,
+            k_index_put,
+            v_view_node,
+            v_clone,
+            v_expand,
+            v_cache_unsqueeze,
+            v_index_put,
+            "gqa_attention_fusion",
+            unique_index=cnt,
+        )
+        cnt += 1
 
 
 def replace_gqa_attention_with_fused_op(
@@ -289,6 +444,7 @@ def replace_gqa_attention_with_fused_op(
     v_cache_unsqueeze: Op,
     v_index_put: Op,
     pattern: str,
+    unique_index: int = 1,
 ):
     """
     Fuse GQA subgraph
@@ -296,10 +452,30 @@ def replace_gqa_attention_with_fused_op(
     """
     fused_cls = classicfuse_register.get(pattern)
     fused_op = fused_cls()
-    fused_op.name = "GQAAttentionFusedOp"
+    fused_op.name = f"GQAAttentionFusedOp_{unique_index}"
+
+    original_order = {op: index for index, op in enumerate(graph.body)}
+    absorbed = [sdpa_node]
+    for branch in (
+        (k_view, k_clone, k_expand, k_cache_unsqueeze),
+        (v_view, v_clone, v_expand, v_cache_unsqueeze),
+    ):
+        removed_names = set()
+        for index, branch_node in enumerate(branch):
+            if index == 0 or all(
+                child in removed_names for child in branch_node._children
+            ):
+                absorbed.append(branch_node)
+                removed_names.add(branch_node.name)
+            else:
+                break
+    fused_source_meta = merge_source_meta(
+        *(op._source_meta for op in sorted(absorbed, key=original_order.get))
+    )
 
     # replace SDPA node with GQAAttentionFusedOp
     graph.displace_node(sdpa_node, fused_op)
+    fused_op._source_meta = fused_source_meta
 
     # clear old KV View input inherited by SDPA
     # assume sdpa_node.args[0] is Query, keep unchanged

@@ -49,6 +49,7 @@ namespace runtime {
 
 namespace {
 static constexpr int kEosToken = 151643; // <|end▁of▁sentence|>
+static constexpr int kEotToken = 151647; // <|EOT|>
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -58,14 +59,14 @@ static constexpr int kEosToken = 151643; // <|end▁of▁sentence|>
 void DeepSeekR1Runner::run(const RunConfig &cfgIn) {
   RunConfig cfg = cfgIn;
 
-  const bool suppress = cfg.suppressStats;
+  const bool suppress = cfg.suppressStats || cfg.streamJsonl;
 
   if (!suppress)
     std::cerr
         << "\033[33;1mDeepSeekR1 Inference (buddy-cli / BuddyRuntime)\033[0m\n";
 
   // ── Chat template: load if provided ─────────────────────────────────────
-  std::vector<long long> stopTokenIds = {kEosToken};
+  std::vector<long long> stopTokenIds = {kEosToken, kEotToken};
   std::unique_ptr<buddy::ChatTemplate> chatTmpl;
 
   if (!cfg.chatTemplatePath.empty()) {
@@ -171,7 +172,7 @@ void DeepSeekR1Runner::run(const RunConfig &cfgIn) {
 
     GenerationResult result =
         runGeneration(finalPrompt, *session, vocabPath, cfg.maxNewTokens,
-                      stopTokenIds, sampler, codec, suppress);
+                      stopTokenIds, sampler, codec, suppress, cfg.streamJsonl);
 
     if (!suppress)
       printStats(result, /*verbose=*/true);

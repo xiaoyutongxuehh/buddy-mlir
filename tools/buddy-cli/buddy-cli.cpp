@@ -31,14 +31,21 @@
 #ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
 #include "buddy/runtime/models/DeepSeekR1Runner.h"
 #endif
+#ifdef BUDDY_CLI_HAVE_LLAMA31_TT_MODEL
+#include "buddy/runtime/models/Llama31TTRunner.h"
+#endif
 
 #include <cerrno>
 #include <cstring>
+#include <dlfcn.h>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef BUDDY_CLI_HAVE_NUMA
 #include <numa.h>
@@ -147,15 +154,30 @@ static void applyNumaCpuBind(const std::string &) {
 //===----------------------------------------------------------------------===//
 
 static std::unique_ptr<buddy::runtime::InferenceRunner>
-makeRunner(const std::string &modelName) {
+makeBuiltinRunner(const std::string &modelName) {
 #ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
   if (modelName.rfind("deepseek_r1", 0) == 0)
     return std::make_unique<buddy::runtime::DeepSeekR1Runner>();
 #endif
+#ifdef BUDDY_CLI_HAVE_LLAMA31_TT_MODEL
+  if (modelName.rfind("llama31_tt", 0) == 0 ||
+      modelName.rfind("llama3.1_tt", 0) == 0 ||
+      modelName.rfind("llama32_tt", 0) == 0 ||
+      modelName.rfind("llama3.2_tt", 0) == 0)
+    return std::make_unique<buddy::runtime::Llama31TTRunner>();
+#endif
 
-#ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
+#if defined(BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL) ||                               \
+    defined(BUDDY_CLI_HAVE_LLAMA31_TT_MODEL)
   const char *unknownHint =
-      "  Supported models: deepseek_r1\n"
+      "  Supported models: "
+#ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
+      "deepseek_r1 "
+#endif
+#ifdef BUDDY_CLI_HAVE_LLAMA31_TT_MODEL
+      "llama31_tt llama3.1_tt llama32_tt llama3.2_tt "
+#endif
+      "\n"
       "  To add a new model, implement InferenceRunner and register it here.";
 #else
   const char *unknownHint =
@@ -168,6 +190,75 @@ makeRunner(const std::string &modelName) {
 #endif
   throw std::runtime_error(std::string("buddy-cli: unknown model '") +
                            modelName + "'.\n" + unknownHint);
+}
+
+class RunnerHandle {
+public:
+  RunnerHandle(const std::string &runnerPath, const std::string &modelName) {
+    if (runnerPath.empty())
+      throw std::runtime_error(
+          "buddy-cli: runner plugin not specified. Use a .rax with "
+          "runner_library or pass --runner-so <path>.");
+
+    handle = dlopen(runnerPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+      throw std::runtime_error(
+          "buddy-cli: dlopen runner failed: " + runnerPath + ": " + dlerror());
+
+    dlerror();
+    auto *createSym = dlsym(handle, "buddy_create_inference_runner_v1");
+    const char *createErr = dlerror();
+    if (createErr)
+      throw std::runtime_error("buddy-cli: runner plugin missing "
+                               "buddy_create_inference_runner_v1: " +
+                               std::string(createErr));
+
+    dlerror();
+    auto *destroySym = dlsym(handle, "buddy_destroy_inference_runner_v1");
+    const char *destroyErr = dlerror();
+    if (destroyErr)
+      throw std::runtime_error("buddy-cli: runner plugin missing "
+                               "buddy_destroy_inference_runner_v1: " +
+                               std::string(destroyErr));
+
+    create =
+        reinterpret_cast<buddy::runtime::CreateInferenceRunnerFn>(createSym);
+    destroy =
+        reinterpret_cast<buddy::runtime::DestroyInferenceRunnerFn>(destroySym);
+    runner = create();
+    if (!runner)
+      throw std::runtime_error("buddy-cli: runner plugin returned null for " +
+                               modelName);
+  }
+
+  ~RunnerHandle() {
+    if (runner && destroy)
+      destroy(runner);
+    if (handle)
+      dlclose(handle);
+  }
+
+  RunnerHandle(const RunnerHandle &) = delete;
+  RunnerHandle &operator=(const RunnerHandle &) = delete;
+
+  buddy::runtime::InferenceRunner &get() { return *runner; }
+
+private:
+  void *handle = nullptr;
+  buddy::runtime::CreateInferenceRunnerFn create = nullptr;
+  buddy::runtime::DestroyInferenceRunnerFn destroy = nullptr;
+  buddy::runtime::InferenceRunner *runner = nullptr;
+};
+
+static std::string resolvePathRelativeToRax(const std::string &path,
+                                            const std::string &raxPath) {
+  namespace fs = std::filesystem;
+  if (path.empty())
+    return "";
+  fs::path p(path);
+  if (p.is_absolute() || raxPath.empty())
+    return p.string();
+  return (fs::absolute(fs::path(raxPath)).parent_path() / p).string();
 }
 
 //===----------------------------------------------------------------------===//
@@ -183,11 +274,19 @@ static void usage(const char *prog) {
       << "  --model-so   <path.so>   Model shared library  (legacy mode)\n"
       << "  --weights    <path>      Weights file           (legacy mode)\n"
       << "  --vocab      <path>      Vocabulary file        (legacy mode)\n"
+      << "  --runner-so  <path.so>   Runner plugin          (legacy mode)\n"
       << "\n"
       << "Inference:\n"
       << "  --prompt     <text>      Input prompt (interactive if omitted)\n"
-      << "  --max-tokens <N>         Max total tokens incl. prompt (default "
+      << "  --prompt-file <path>     One prompt per line for fixed-batch runs\n"
+      << "  --prompt-length <N>      Fixed prompt/prefill length in tokens\n"
+      << "  --audio      <path>      Audio file for speech models (e.g. "
+         "Whisper)\n"
+      << "  --image      <path>      Image file for vision-language models\n"
+      << "  --max-tokens <N>         Max generated tokens (default "
          "1024)\n"
+      << "  --batch-size <N>         Batch size override for fixed-batch "
+         "packages\n"
       << "\n"
       << "Sampling:\n"
       << "  --temperature <float>    Sampling temperature (0.0 = greedy, "
@@ -207,6 +306,11 @@ static void usage(const char *prog) {
       << "\n"
       << "Output:\n"
       << "  --no-stats               Suppress performance statistics\n"
+      << "  --defer-decode-token-readback\n"
+      << "                           Defer device token-id readback until "
+         "after\n"
+      << "                           fixed-step decode when supported\n"
+      << "  --stream-jsonl           Emit token events as JSON Lines\n"
       << "\n"
       << "NUMA / affinity (applied before model load):\n"
       << "  --cpus       <spec>      CPU affinity, e.g. 0-47 or 0-15,32-47\n"
@@ -225,6 +329,9 @@ static void usage(const char *prog) {
       << "Other:\n"
       << "  --help / -h\n"
       << "\n"
+      << "Batch output:\n"
+      << "  --print-all-batch        Print every user in batch runs\n"
+      << "\n"
       << "Examples:\n"
       << "  # Equivalent to: numactl --cpunodebind=0,1,2,3 "
          "--interleave=0,1,2,3 \\\n"
@@ -241,8 +348,14 @@ int main(int argc, char **argv) {
   std::string modelSoPath;
   std::string weightsPath;
   std::string vocabPath;
+  std::string runnerSoPath;
   std::string prompt;
+  std::string promptFile;
+  int promptLength = 0;
+  std::string audioPath;
+  std::string imagePath;
   int maxTokens = 4096;
+  int batchSize = 0;
 
   // Sampling args
   float temperature = 0.0f;
@@ -256,6 +369,9 @@ int main(int argc, char **argv) {
   // Chat template & output
   std::string chatTemplatePath;
   bool suppressStats = false;
+  bool printAllBatchOutputs = false;
+  bool deferDecodeTokenReadback = false;
+  bool streamJsonl = false;
   bool interactive = false;
 
   // NUMA / affinity args (applied before model load)
@@ -274,10 +390,22 @@ int main(int argc, char **argv) {
       weightsPath = argv[++i];
     else if (a == "--vocab" && i + 1 < argc)
       vocabPath = argv[++i];
+    else if (a == "--runner-so" && i + 1 < argc)
+      runnerSoPath = argv[++i];
     else if (a == "--prompt" && i + 1 < argc)
       prompt = argv[++i];
+    else if (a == "--prompt-file" && i + 1 < argc)
+      promptFile = argv[++i];
+    else if (a == "--prompt-length" && i + 1 < argc)
+      promptLength = std::stoi(argv[++i]);
+    else if (a == "--audio" && i + 1 < argc)
+      audioPath = argv[++i];
+    else if (a == "--image" && i + 1 < argc)
+      imagePath = argv[++i];
     else if (a == "--max-tokens" && i + 1 < argc)
       maxTokens = std::stoi(argv[++i]);
+    else if (a == "--batch-size" && i + 1 < argc)
+      batchSize = std::stoi(argv[++i]);
     else if (a == "--temperature" && i + 1 < argc)
       temperature = std::stof(argv[++i]);
     else if (a == "--top-k" && i + 1 < argc)
@@ -296,6 +424,12 @@ int main(int argc, char **argv) {
       chatTemplatePath = argv[++i];
     else if (a == "--no-stats")
       suppressStats = true;
+    else if (a == "--defer-decode-token-readback")
+      deferDecodeTokenReadback = true;
+    else if (a == "--stream-jsonl")
+      streamJsonl = true;
+    else if (a == "--print-all-batch")
+      printAllBatchOutputs = true;
     else if (a == "--interactive")
       interactive = true;
     else if (a == "--cpus" && i + 1 < argc)
@@ -337,8 +471,37 @@ int main(int argc, char **argv) {
     usage(argv[0]);
     return 2;
   }
+  if (streamJsonl && deferDecodeTokenReadback) {
+    std::cerr << "\033[31;1m[Error]\033[0m "
+                 "--stream-jsonl requires per-step token readback; do not "
+                 "combine it with --defer-decode-token-readback.\n";
+    return 2;
+  }
 
-  if (prompt.empty() && !interactive) {
+  std::vector<std::string> prompts;
+  if (!promptFile.empty()) {
+    std::ifstream input(promptFile);
+    if (!input) {
+      std::cerr << "\033[31;1m[Error]\033[0m cannot read --prompt-file "
+                << promptFile << "\n";
+      return 1;
+    }
+    std::string line;
+    while (std::getline(input, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      prompts.push_back(line);
+    }
+    if (prompts.empty()) {
+      std::cerr << "\033[31;1m[Error]\033[0m --prompt-file is empty: "
+                << promptFile << "\n";
+      return 1;
+    }
+  }
+
+  // Speech and vision-language runs are driven by media inputs.
+  if (prompt.empty() && prompts.empty() && audioPath.empty() &&
+      imagePath.empty() && !interactive) {
     std::cout << "Prompt: ";
     std::getline(std::cin, prompt);
     std::cout << "\n";
@@ -346,10 +509,12 @@ int main(int argc, char **argv) {
 
   // ── Determine model type ─────────────────────────────────────────────────
   std::string modelName;
+  std::string manifestRunnerSoPath;
   if (!raxPath.empty()) {
     try {
       auto manifest = buddy::runtime::ModelManifest::loadFromRax(raxPath);
       modelName = manifest.modelName;
+      manifestRunnerSoPath = manifest.runnerLibraryPath;
     } catch (const std::exception &e) {
       std::cerr << "\033[31;1m[Error]\033[0m reading manifest: " << e.what()
                 << "\n";
@@ -362,8 +527,11 @@ int main(int argc, char **argv) {
       modelName = "deepseek_r1";
     }
   } else {
-    modelName = "deepseek_r1";
+    modelName = "legacy";
   }
+  if (runnerSoPath.empty())
+    runnerSoPath = manifestRunnerSoPath;
+  runnerSoPath = resolvePathRelativeToRax(runnerSoPath, raxPath);
 
   // ── Run ──────────────────────────────────────────────────────────────────
   buddy::runtime::RunConfig cfg;
@@ -372,7 +540,12 @@ int main(int argc, char **argv) {
   cfg.weightsPath = weightsPath;
   cfg.vocabPath = vocabPath;
   cfg.prompt = prompt;
+  cfg.prompts = std::move(prompts);
+  cfg.audioPath = audioPath;
+  cfg.promptLength = promptLength;
+  cfg.imagePath = imagePath;
   cfg.maxNewTokens = maxTokens;
+  cfg.batchSize = batchSize;
   cfg.samplerConfig.temperature = temperature;
   cfg.samplerConfig.topK = topK;
   cfg.samplerConfig.topP = topP;
@@ -382,11 +555,19 @@ int main(int argc, char **argv) {
   cfg.samplerConfig.seed = seed;
   cfg.chatTemplatePath = chatTemplatePath;
   cfg.suppressStats = suppressStats;
+  cfg.printAllBatchOutputs = printAllBatchOutputs;
+  cfg.deferDecodeTokenReadback = deferDecodeTokenReadback;
+  cfg.streamJsonl = streamJsonl;
   cfg.interactive = interactive;
 
   try {
-    auto runner = makeRunner(modelName);
-    runner->run(cfg);
+    if (!runnerSoPath.empty()) {
+      RunnerHandle runner(runnerSoPath, modelName);
+      runner.get().run(cfg);
+    } else {
+      auto runner = makeBuiltinRunner(modelName);
+      runner->run(cfg);
+    }
   } catch (const std::exception &e) {
     std::cerr << "\033[31;1m[Error]\033[0m " << e.what() << "\n";
     return 1;

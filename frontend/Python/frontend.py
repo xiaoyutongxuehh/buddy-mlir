@@ -28,6 +28,7 @@ import ctypes.util
 import operator
 import os
 import platform
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -35,21 +36,22 @@ import torch
 import torch._dynamo as dynamo
 from buddy_mlir import runtime as rt
 from buddy_mlir.execution_engine import ExecutionEngine
-from buddy_mlir.passmanager import *
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from .graph import DeviceType, Graph, NodeType, TensorDType
 from .graph.operation import *
+from .graph.source_meta import extract_source_meta
 from .graph.transform import (
     RUNTIME_RNG_TRANSFORMS,
     maxpool2d_simplify,
+    trace_insertion,
 )
-from .graph.type import *
 from .ops.func import ops_registry as func_ops_registry
 from .ops.linalg import ops_registry as linalg_ops_registry
 from .ops.math import ops_registry as math_ops_registry
 from .ops.tosa import ops_registry as tosa_ops_registry
+from .trace.config import TraceConfig as _TraceConfig
 
 EXTERNAL_CALL_TRANSFORM_GROUPS = {
     "rng": tuple(RUNTIME_RNG_TRANSFORMS),
@@ -58,6 +60,10 @@ EXTERNAL_CALL_TRANSFORM_GROUPS = {
 EXTERNAL_CALL_GROUP_LIBS = {
     "rng": "libbuddy_external_rng",
 }
+
+
+def _is_unsupported_get_attr(gm_node) -> bool:
+    return gm_node.op == "get_attr" and "_tensor_constant" not in gm_node.name
 
 
 class DynamoCompiler:
@@ -77,8 +83,10 @@ class DynamoCompiler:
         primary_registry: dict | None = None,
         aot_autograd_decomposition: dict | None = None,
         verbose=False,
+        verbose_path: str | os.PathLike | None = None,
         enable_external_calls: bool = False,
         capture_scalar_outputs: bool = False,
+        trace: _TraceConfig | None = None,
     ) -> None:
         """
         Initializes the Dynamo Compiler.
@@ -91,9 +99,12 @@ class DynamoCompiler:
             verbose (bool): Controls whether to print additional information for
                 debugging purposes. The default value is False, indicating that
                 no extra debug information will be printed.
+            verbose_path (str | os.PathLike, optional): Redirect verbose output
+                to this file instead of stdout.
             enable_external_calls (bool): Enable external function call support (for oneDNN, etc.)
             capture_scalar_outputs (bool): Enable scalar output capture in
                 TorchDynamo to avoid graph breaks from scalar escapes.
+            trace (TraceConfig, optional): Trace node metadata and output paths.
         Attributes:
             _func_name: The function name to be used.
             _aot_autograd_decomposition (Optional[dict], optional):
@@ -115,10 +126,14 @@ class DynamoCompiler:
         self._func_name = func_name
         self._aot_autograd_decomposition = aot_autograd_decomposition
         self._verbose = verbose
+        self._verbose_path = (
+            Path(verbose_path) if verbose_path is not None else None
+        )
         self._enable_external_calls = enable_external_calls
         self._imported_graphs = []
         self._ops_registry = {}
         self._imported_params = {}
+        self._trace = trace
         self._model_config = type("Config", (), {"decode_with_cache": False})
         self._ops_registry.update(math_ops_registry)
         self._ops_registry.update(linalg_ops_registry)
@@ -132,9 +147,12 @@ class DynamoCompiler:
             "arange.default": ArangeOp,
             "unsqueeze.default": UnsqueezeOp,
             "view.default": ViewOp,
+            "_unsafe_view.default": ViewOp,
             "view.dtype": ViewDtypeOp,
             "ones.default": OnesOp,
+            "new_ones.default": OnesOp,
             "full.default": FullOp,
+            "new_full.default": FullOp,
             "embedding.default": EmbeddingOp,
             "masked_fill.Scalar": MaskedFillOp,
             "slice.Tensor": SliceOp,
@@ -172,6 +190,7 @@ class DynamoCompiler:
             "clone.default": CloneOp,
             "silu.default": SiluOp,
             "add.Tensor": AddOp,
+            "addcmul.default": AddCMulOp,
             "addmm.default": AddMMOp,
             "addbmm.default": AddbmmOp,
             "addbmm_.default": AddbmmOp,
@@ -204,6 +223,7 @@ class DynamoCompiler:
             "adaptive_avg_pool1d.default": AdaptiveAvgPool1dOp,
             "_adaptive_avg_pool2d.default": AdaptiveAvgPool2dOp,
             "_adaptive_avg_pool3d.default": AdaptiveAvgPool3dOp,
+            "_low_memory_max_pool2d_with_offsets.default": MaxPool2dWithIndicesOp,
             "relu.default": ReluOp,
             "iota.default": IotaOp,
             "sigmoid.default": SigmoidOp,
@@ -289,6 +309,8 @@ class DynamoCompiler:
             "bitwise_right_shift.Tensor_Scalar_out": BitwiseRightShiftOp,
             "bitwise_right_shift.Scalar_Tensor_out": BitwiseRightShiftOp,
             "index_put.default": IndexPutOp,
+            "fill_cache.default": FillCacheOp,
+            "update_cache.default": UpdateCacheOp,
             "ne.Scalar": NeScalarOp,
             "cumsum.default": CumsumOp,
             "cumprod.default": CumProdOp,
@@ -358,6 +380,7 @@ class DynamoCompiler:
             "tan.default": TanOp,
             "exp2.default": Exp2Op,
             "zeros.default": ZerosOp,
+            "new_zeros.default": ZerosOp,
             "zeros_like.default": ZerosLikeOp,
             "ones_like.default": OnesLikeOp,
             "full_like.default": FullLikeOp,
@@ -830,30 +853,48 @@ class DynamoCompiler:
                     continue
                 buddy_node.add_argument(str(input_arg))
             return buddy_node
+        if (
+            gm_node_name in ("new_ones.default", "new_zeros.default")
+            and len(node_input) >= 2
+        ):
+            node_input = [node_input[1]]
+        elif gm_node_name == "new_full.default" and len(node_input) >= 3:
+            node_input = [node_input[1], node_input[2]]
 
-        def _add_arg_and_parents(arg):
-            if isinstance(arg, torch.fx.Node):
-                buddy_node.add_argument(str(arg))
-                buddy_node.add_parent(str(arg))
-            elif isinstance(arg, torch.dtype):
-                buddy_node.add_argument(self._torch_dtype_translate(str(arg)))
-            elif isinstance(arg, (list, tuple)):
-                # Traverse elements to collect parent nodes but keep the container as a single argument
-                for item in arg:
-                    if isinstance(item, torch.fx.Node):
-                        buddy_node.add_parent(str(item))
-                buddy_node.add_argument(arg)
-            else:
-                buddy_node.add_argument(arg)
-            return arg
+        def _convert_operand(value, collect_parents):
+            if isinstance(value, torch.fx.Node):
+                name = str(value)
+                if collect_parents:
+                    buddy_node.add_parent(name)
+                return name
+            if isinstance(value, torch.dtype):
+                return self._torch_dtype_translate(str(value))
+            if isinstance(value, list):
+                return [
+                    _convert_operand(item, collect_parents) for item in value
+                ]
+            if isinstance(value, tuple):
+                return tuple(
+                    _convert_operand(item, collect_parents) for item in value
+                )
+            if isinstance(value, dict):
+                return {
+                    _convert_operand(key, collect_parents): _convert_operand(
+                        item, collect_parents
+                    )
+                    for key, item in value.items()
+                }
+            return value
 
         for input_arg in node_input:
-            _add_arg_and_parents(input_arg)
+            buddy_node.add_argument(_convert_operand(input_arg, True))
         for user in node_users:
             buddy_node.add_children(user)
         if node_kwargs is None:
             node_kwargs = {}
-        buddy_node._keyword_arguments.update(node_kwargs)
+        buddy_node._keyword_arguments.update(
+            _convert_operand(node_kwargs, False)
+        )
         buddy_node._tensor_meta["shape"] = node_output_shape
         buddy_node._tensor_meta["dtype"] = node_output_dtype
         return buddy_node
@@ -869,7 +910,7 @@ class DynamoCompiler:
 
         Args:
             gm (torch.fx.GraphModule): The GraphModule to be compiled.
-            inputs (List[torch.Tensor]): The input tensors.
+            inputs (list[torch.Tensor]): The input tensors.
             return_type (str): Controls the compiled callable that AOTAutograd
                 receives from the Buddy compiler.
                 - "eager": return the FX graph forward (legacy behavior).
@@ -886,6 +927,11 @@ class DynamoCompiler:
         # }
         # print(len(params))
         # params_flat, _ = pytree.tree_flatten(params)
+        # ===--------------------------------------------------
+        # 1. First traverse the graph
+        # distinguish input, param, and buffer nodes, and assign
+        # index to each node.
+        # ===--------------------------------------------------
         inputs_pos = []
         params_pos = []
         buffers_pos = []
@@ -900,10 +946,20 @@ class DynamoCompiler:
                 params_pos.append(i)
 
         params_flat = [inputs[i] for i in params_pos + buffers_pos]
+        runtime_inputs_flat = [inputs[i] for i in inputs_pos]
 
         if self._verbose:
-            print("Graph in tabular form:")
-            gm.graph.print_tabular()
+            if self._verbose_path is None:
+                print("Graph in tabular form:")
+                gm.graph.print_tabular()
+            else:
+                self._verbose_path.parent.mkdir(parents=True, exist_ok=True)
+                with (
+                    self._verbose_path.open("w") as verbose_file,
+                    contextlib.redirect_stdout(verbose_file),
+                ):
+                    print("Graph in tabular form:")
+                    gm.graph.print_tabular()
 
         def _compiler(_gm: torch.fx.GraphModule, _inputs: list[torch.Tensor]):
             """Compile a FX graph in Aten/Prims IR to MLIR."""
@@ -912,14 +968,20 @@ class DynamoCompiler:
                 self._func_name,
                 DeviceType.CPU,
                 self._verbose,
+                self._verbose_path,
                 self._enable_external_calls,
             )
             graph._params_ref = params_flat
+            graph._runtime_inputs_ref = runtime_inputs_flat
             param_nodes = []
             buffers_nodes = []
             input_nodes = []
             other_nodes = []
             all_nodes = list(_gm.graph.nodes)
+            # ===--------------------------------------------------
+            # 2. Second traverse the graph
+            # collect each type of nodes into the corresponding list.
+            # ===--------------------------------------------------
             for i, node in enumerate(all_nodes):
                 if i in params_pos:
                     param_nodes.append(node)
@@ -935,9 +997,16 @@ class DynamoCompiler:
                 (NodeType.InputNode, input_nodes),
                 (NodeType.OtherNode, other_nodes),
             ]
-
+            # ===--------------------------------------------------
+            # 3. Third traverse the graph
+            # turn FX graph into Buddy graph.
+            # turn gm_nodes into buddy_nodes.
+            # ===--------------------------------------------------
             for node_type, gm_nodes_sublist in gm_nodes:
                 for gm_node in gm_nodes_sublist:
+                    if _is_unsupported_get_attr(gm_node):
+                        continue
+                    source_meta = extract_source_meta(gm_node)
                     node_users = []
                     for user in gm_node.users:
                         node_users.append(str(user))
@@ -991,14 +1060,30 @@ class DynamoCompiler:
                             value = None
                             if match:
                                 value = float(match.group(1))
+                            val = gm_node.meta.get("val")
                             if value is None:
-                                val = gm_node.meta.get("val")
                                 if isinstance(val, torch.Tensor):
-                                    if val.numel() != 1:
-                                        raise NotImplementedError(
-                                            "_tensor_constant only supports scalar tensors"
-                                        )
-                                    value = val.item()
+                                    if val.numel() == 1:
+                                        value = val.item()
+                                    else:
+                                        # Dense folded tensor constants appear
+                                        # in LLM masks/positions. Preserve the
+                                        # payload so TTIR lowering can emit a
+                                        # real tensor constant instead of a
+                                        # scalar-only placeholder.
+                                        t = val.detach().cpu().contiguous()
+                                        try:
+                                            if t.dtype == torch.bfloat16:
+                                                value = t.float().numpy()
+                                            else:
+                                                value = t.numpy()
+                                        except (TypeError, RuntimeError):
+                                            if t.dtype == torch.bfloat16:
+                                                value = np.asarray(
+                                                    t.tolist(), dtype=np.float32
+                                                )
+                                            else:
+                                                value = np.asarray(t.tolist())
                                 elif isinstance(val, (int, float)):
                                     value = val
                             if value is None:
@@ -1008,7 +1093,7 @@ class DynamoCompiler:
 
                             gm_node.insert_arg(len(gm_node.args), value)
                             val = gm_node.meta.get("val")
-                            node_shape = val.shape
+                            node_shape = list(val.shape)
                             node_dtype = self._torch_dtype_translate(
                                 str(val.dtype)
                             )
@@ -1072,7 +1157,13 @@ class DynamoCompiler:
                         buddy_node._torch_out_kwarg_names = (
                             self._extract_tensor_out_kwarg_names(gm_node.target)
                         )
+                    buddy_node._source_meta = source_meta
                     graph.add_node(node=buddy_node, node_type=node_type)
+            # ===--------------------------------------------------
+            # 5. Fifth traverse the graph
+            # perform the graph transformation. This step is performed
+            # by each frontend pass itself.
+            # ===--------------------------------------------------
             transform_list = [
                 maxpool2d_simplify,
             ]
@@ -1084,6 +1175,8 @@ class DynamoCompiler:
                 ) in EXTERNAL_CALL_TRANSFORM_GROUPS.items():
                     transform_list.extend(group_transforms)
                     enabled_external_groups.append(group_name)
+            if self._trace is not None:
+                transform_list.append(trace_insertion(self._trace))
             graph._enabled_external_groups = enabled_external_groups
             graph.perform(transform_list)
             self._imported_graphs.append(graph)
@@ -1119,7 +1212,7 @@ class DynamoCompiler:
 
         Args:
             gm (torch.fx.GraphModule): The GraphModule to be compiled.
-            inputs (List[torch.Tensor]): The input tensors.
+            inputs (list[torch.Tensor]): The input tensors.
 
         Returns:
             dynamo_run: The function of the ahead-of-time compiled module,
@@ -1254,15 +1347,48 @@ class DynamoCompiler:
             ):
                 return resolved
 
+            llvm_build_dir = os.path.abspath(
+                os.path.join(lib_base_path, os.pardir)
+            )
+            candidate_dirs = [
+                lib_base_path,
+                # LLVM runtimes mode builds libomp here before install.
+                os.path.join(
+                    llvm_build_dir,
+                    "runtimes",
+                    "runtimes-bins",
+                    "openmp",
+                    "runtime",
+                    "src",
+                ),
+            ]
+            for candidate_dir in candidate_dirs:
+                candidate = os.path.join(
+                    candidate_dir, "libomp" + lib_extension
+                )
+                if os.path.isfile(candidate):
+                    return candidate
+
             return os.path.join(lib_base_path, "libomp" + lib_extension)
 
         graph.compile()
+
         # Collect dependency libraries.
         lib_extension = get_lib_extension()
         lib_names = ["libmlir_runner_utils", "libmlir_c_runner_utils"]
         path_prefix = os.path.dirname(os.path.abspath(__file__))
-        lib_base_path = os.path.join(path_prefix, "../../../../llvm/build/lib/")
-        lib_base_path = os.path.abspath(lib_base_path)
+
+        LLVM_LIBS_DIR = os.getenv("LLVM_LIBS_DIR")
+        if LLVM_LIBS_DIR:
+            # Out-of-Tree LLVM
+            lib_base_path = LLVM_LIBS_DIR
+        else:
+            # Local LLVM
+            lib_base_path = os.path.join(
+                path_prefix, "../../../../llvm/build/lib/"
+            )
+            lib_base_path = os.path.abspath(lib_base_path)
+
         shared_libs = [
             os.path.join(lib_base_path, lib_name + lib_extension)
             for lib_name in lib_names
@@ -1280,9 +1406,13 @@ class DynamoCompiler:
                 shared_libs.append(
                     os.path.join(buddy_lib_base_path, lib_name + lib_extension)
                 )
+
         # Define execution engine.
         ee = ExecutionEngine(
-            graph._imported_module, opt_level=3, shared_libs=shared_libs
+            graph._imported_module,
+            opt_level=3,
+            shared_libs=shared_libs,
+            enable_pic=platform.machine().startswith("riscv"),
         )
 
         def exec_buddy_graph(*args):
@@ -1290,11 +1420,11 @@ class DynamoCompiler:
             Execute a graph using TorchDynamo with the provided input tensors.
 
             Args:
-                *args: List[torch.Tensor]
+                *args: list[torch.Tensor]
                 Input tensors to be passed to the graph's function.
 
             Returns:
-            List[torch.Tensor]
+            list[torch.Tensor]
                 The result of executing the graph, represented as a list of
                 output tensors.
             """

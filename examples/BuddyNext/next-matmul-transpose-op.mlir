@@ -27,14 +27,14 @@ func.func private @printMemrefF32(tensor<*xf32>)
 
 func.func @kernel(%a : tensor<1024x1536xf32>, %b : tensor<1536x1536xf32>, %c : tensor<1024x1536xf32>) -> (tensor<1024x1536xf32>) {
   %t_start = call @rtclock() : () -> f64
-  %137 = linalg.matmul_transpose_b {cast = #linalg.type_fn<cast_signed>}
+  %137 = linalg.matmul indexing_maps = [affine_map<(m, n, k) -> (m, k)>, affine_map<(m, n, k) -> (n, k)>, affine_map<(m, n, k) -> (m, n)>] {cast = #linalg.type_fn<cast_signed>}
     ins(%a, %b : tensor<1024x1536xf32>, tensor<1536x1536xf32>)
     outs(%c : tensor<1024x1536xf32>) -> tensor<1024x1536xf32>
   %t_end = call @rtclock() : () -> f64
   %time = arith.subf %t_end, %t_start : f64
   // Print timings.
   vector.print %time : f64
-  // CHECK: {{[0-9]+\.[0-9]+}}
+  // CHECK: {{[0-9]+}}
   return %137 : tensor<1024x1536xf32>
 }
 

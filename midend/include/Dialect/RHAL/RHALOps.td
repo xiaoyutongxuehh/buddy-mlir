@@ -33,25 +33,44 @@ class RHAL_Op<string mnemonic, list<Trait> traits = []> :
 //
 // Syntax:
 //   rhal.module @name attributes {version = "...", model_name = "...",
-//                                  vocab_uri = "..."} {
+//                                  vocab_uri = "...",
+//                                  runner_library = "...",
+//                                  serving_library = "...",
+//                                  embedding_library = "...",
+//                                  runner_uri = "..."} {
 //     ... rhal.constant, rhal.codeobj, rhal.buffer, rhal.func ops ...
 //   }
 //===----------------------------------------------------------------------===//
 
 def RHAL_ModuleOp : RHAL_Op<"module", [
     AffineScope, IsolatedFromAbove, NoRegionArguments,
-    SymbolTable, Symbol, NoTerminator, SingleBlock]> {
+    SymbolTable, SymbolName, SymbolVisibility, Symbol,
+    NoTerminator, SingleBlock]> {
   let summary = "RHAL model manifest module.";
   let description = [{
     Top-level container op that declares all model resources and functions.
-    Attributes carry module-level metadata (version, model_name, vocab_uri).
+    Attributes carry module-level metadata (version, model_name, vocab_uri,
+    runner_library, serving_library, embedding_library).
   }];
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     OptionalAttr<StrAttr>:$version,
     OptionalAttr<StrAttr>:$model_name,
-    OptionalAttr<StrAttr>:$vocab_uri
+    OptionalAttr<StrAttr>:$vocab_uri,
+    OptionalAttr<StrAttr>:$runner_library,
+    OptionalAttr<StrAttr>:$serving_library,
+    OptionalAttr<StrAttr>:$embedding_library,
+    OptionalAttr<StrAttr>:$runner_uri,
+    OptionalAttr<StrAttr>:$artifacts_uri,
+    OptionalAttr<StrAttr>:$tokenizer_uri,
+    OptionalAttr<StrAttr>:$official_reference_uri,
+    OptionalAttr<StrAttr>:$official_trace_uri,
+    OptionalAttr<StrAttr>:$max_cache_len,
+    OptionalAttr<StrAttr>:$ignore_system_desc,
+    OptionalAttr<StrAttr>:$ignore_eos,
+    OptionalAttr<StrAttr>:$device_token_loop
   );
   let regions = (region SizedRegion<1>:$body);
 
@@ -68,7 +87,7 @@ def RHAL_ModuleOp : RHAL_Op<"module", [
 //                              type = tensor<...xf32>, uri = "file:..."
 //===----------------------------------------------------------------------===//
 
-def RHAL_ConstantOp : RHAL_Op<"constant", [Symbol]> {
+def RHAL_ConstantOp : RHAL_Op<"constant", [SymbolName, SymbolVisibility, Symbol]> {
   let summary = "External model constant (weight) declaration.";
   let description = [{
     Declares a model weight tensor stored outside the .rax file.
@@ -79,6 +98,7 @@ def RHAL_ConstantOp : RHAL_Op<"constant", [Symbol]> {
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     I32Attr:$id,
     StrAttr:$storage,
     TypeAttr:$type,
@@ -98,7 +118,7 @@ def RHAL_ConstantOp : RHAL_Op<"constant", [Symbol]> {
 //                              backend = "cpu", uri = "file:..."
 //===----------------------------------------------------------------------===//
 
-def RHAL_CodeobjOp : RHAL_Op<"codeobj", [Symbol]> {
+def RHAL_CodeobjOp : RHAL_Op<"codeobj", [SymbolName, SymbolVisibility, Symbol]> {
   let summary = "Compiled kernel code object declaration.";
   let description = [{
     Declares a compiled kernel library (e.g. a .so file) that provides
@@ -110,6 +130,7 @@ def RHAL_CodeobjOp : RHAL_Op<"codeobj", [Symbol]> {
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     I32Attr:$id,
     StrAttr:$kind,
     StrAttr:$backend,
@@ -128,7 +149,7 @@ def RHAL_CodeobjOp : RHAL_Op<"codeobj", [Symbol]> {
 //   rhal.buffer @name space = "host"|"dram", type = tensor<...>
 //===----------------------------------------------------------------------===//
 
-def RHAL_BufferOp : RHAL_Op<"buffer", [Symbol]> {
+def RHAL_BufferOp : RHAL_Op<"buffer", [SymbolName, SymbolVisibility, Symbol]> {
   let summary = "Named buffer descriptor (input, output, or KV-cache state).";
   let description = [{
     Declares a named buffer used by the model functions.
@@ -138,6 +159,7 @@ def RHAL_BufferOp : RHAL_Op<"buffer", [Symbol]> {
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     StrAttr:$space,
     TypeAttr:$type
   );
@@ -156,7 +178,7 @@ def RHAL_BufferOp : RHAL_Op<"buffer", [Symbol]> {
 //                   args = ["buf1", "buf2", ...]
 //===----------------------------------------------------------------------===//
 
-def RHAL_FuncOp : RHAL_Op<"func", [Symbol]> {
+def RHAL_FuncOp : RHAL_Op<"func", [SymbolName, SymbolVisibility, Symbol]> {
   let summary = "Model function dispatch declaration.";
   let description = [{
     Declares a model entry point and its dispatch configuration:
@@ -169,6 +191,7 @@ def RHAL_FuncOp : RHAL_Op<"func", [Symbol]> {
 
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<StrAttr>:$sym_visibility,
     ArrayAttr:$inputs,
     ArrayAttr:$outputs,
     StrAttr:$dispatch,

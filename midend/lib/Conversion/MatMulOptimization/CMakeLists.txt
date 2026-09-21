@@ -1,7 +1,9 @@
 add_mlir_library(MatMulOptimization
+  MatMulParallelVectorizationTiling.cpp
   MatMulOptimize.cpp
   MatMulVectorization.cpp
   MatMulVectorizationDecode.cpp
+  MatMulVectorizationDecodePacked.cpp
   DequantMatMulVectorizationDecode.cpp
   Int4DequantMatMulVectorizationDecode.cpp
   MatMulParallelVectorization.cpp
@@ -11,6 +13,7 @@ add_mlir_library(MatMulOptimization
   BatchMatMulSCFOptimize.cpp
   BatchMatMulVectorizationDecode.cpp
   MatMulTransposeBVec.cpp
+  MatMulTransposeBVecDecode.cpp
   BatchMatMulOptimize.cpp
   BatchMatMulTileOptimize.cpp
   BatchMatMulSCFOptimize.cpp
@@ -33,6 +36,14 @@ add_mlir_library(MatMulTransposeBVec
   MatMulTransposeBVec.cpp
 )
 
+add_mlir_library(MatMulTransposeBVecDecode
+  MatMulTransposeBVecDecode.cpp
+)
+
 add_mlir_library(MatMulBlisVectorization
   MatMulBlisVectorization.cpp
+)
+
+add_mlir_library(MatMulParallelVectorizationTiling
+  MatMulParallelVectorizationTiling.cpp
 )

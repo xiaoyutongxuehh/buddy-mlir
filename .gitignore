@@ -21,3 +21,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Tenstorrent runtime artifacts
+ttrt-artifacts/
+/query_results.json
+/ttrt_report.xml
+.py-stage
+.venv/
+
+# SyncBots agent output (upgrade logs / iteration summaries)
+syncbots-output/
+llm_config.yaml

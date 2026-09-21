@@ -1,4 +1,18 @@
 // RUN: buddy-opt %s --lower-xt-ame | FileCheck %s
+// RUN: buddy-opt %s \
+// RUN:   --lower-xt-ame \
+// RUN:   -convert-linalg-to-loops \
+// RUN:   -lower-affine \
+// RUN:   -convert-scf-to-cf \
+// RUN:   -convert-cf-to-llvm \
+// RUN:   -convert-arith-to-llvm \
+// RUN:   -convert-math-to-llvm \
+// RUN:   -convert-func-to-llvm \
+// RUN:   -finalize-memref-to-llvm \
+// RUN:   -reconcile-unrealized-casts | \
+// RUN: buddy-translate -buddy-to-llvmir | \
+// RUN: buddy-llc -filetype=asm -mtriple=riscv64-unknown-linux-gnu \
+// RUN:   -mattr=+m,+a,+c,+d,+xtheadame -o - | FileCheck %s --check-prefix=ASM
 
 module {
 
@@ -85,7 +99,7 @@ module {
     // Step 3: Load matrix A to tile register 0 (shape: mtilem x mtilek = 4x4)
     xt_ame.th.mlde8 1, %stride_a, %a_ptr: memref<4x4xi8>
 
-    // Step 4: Load matrix B to tile register 1 (shape: mtilek x mtilen = 4x4)
+    // Step 4: Load transposed matrix B to tile register 1 (shape: mtilen x mtilek = 4x4)
     xt_ame.th.mldte8 2, %stride_b, %b_ptr: memref<4x4xi8>
 
     // Step 5: Execute matrix multiply: acc0 = acc0 + tile0 x tile1
@@ -136,11 +150,14 @@ module {
 
 // Expected lowering for tile-based operations:
 // CHECK-LABEL: func.func @main
-// CHECK: llvm.call @llvm.riscv.buddy.th.mcfgmi
-// CHECK: llvm.call @llvm.riscv.buddy.th.mcfgni
-// CHECK: llvm.call @llvm.riscv.buddy.th.mcfgki
-// CHECK: llvm.call @llvm.riscv.buddy.th.mzero
-// CHECK: llvm.call @llvm.riscv.buddy.th.mlde8
-// CHECK: llvm.call @llvm.riscv.buddy.th.mldte8
-// CHECK: llvm.call @llvm.riscv.buddy.th.mmacc.w.b
-// CHECK: llvm.call @llvm.riscv.buddy.th.mste32
+// CHECK: llvm.call @llvm.riscv.th.mcfgmi
+// CHECK: llvm.call @llvm.riscv.th.mcfgni
+// CHECK: llvm.call @llvm.riscv.th.mcfgki
+// CHECK: llvm.call @llvm.riscv.th.mzero
+// CHECK: llvm.call @llvm.riscv.th.mlde8
+// CHECK: llvm.call @llvm.riscv.th.mldte8
+// CHECK: llvm.call @llvm.riscv.th.mmacc.w.b
+// CHECK: llvm.call @llvm.riscv.th.mste32
+
+// ASM: .attribute 5, "{{.*xtheadmatrix.*}}"
+// ASM: th.mmacc.w.b{{[ \t]}}

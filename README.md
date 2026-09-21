@@ -20,34 +20,52 @@ sudo apt install flatbuffers-compiler libflatbuffers-dev libnuma-dev
 ### Clone and Initialize
 
 ```
-$ git clone git@github.com:buddy-compiler/buddy-mlir.git
-$ cd buddy-mlir
-$ git submodule update --init llvm
+git clone git@github.com:buddy-compiler/buddy-mlir.git
+cd buddy-mlir
+git submodule update --init llvm
 ```
 
 ### Prepare Python Environment
 
+pip
+
 ```
-$ conda activate <your virtual environment name>
-$ cd buddy-mlir
-$ pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+uv
+
+```
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+conda
+
+```
+conda activate <your virtual environment name>
+cd buddy-mlir
+pip install -r requirements.txt
 ```
 
 ### Build and Test LLVM/MLIR/CLANG
 
 ```
-$ cd buddy-mlir
-$ mkdir llvm/build
-$ cd llvm/build
-$ cmake -G Ninja ../llvm \
-    -DLLVM_ENABLE_PROJECTS="mlir;clang;openmp" \
+cd buddy-mlir
+cmake -G Ninja -S llvm/llvm -B llvm/build \
+    -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+    -DLLVM_ENABLE_RUNTIMES="openmp" \
     -DLLVM_TARGETS_TO_BUILD="host;RISCV" \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DOPENMP_ENABLE_LIBOMPTARGET=OFF \
     -DCMAKE_BUILD_TYPE=RELEASE \
     -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-    -DPython3_EXECUTABLE=$(which python3)
-$ ninja check-clang check-mlir omp
+    -DPython3_EXECUTABLE="$(which python)" \
+    -DPython_EXECUTABLE="$(which python)"
+ninja -C llvm/build check-clang check-mlir check-openmp
 ```
 
 If your target machine includes an NVIDIA GPU, you can add the following configuration:
@@ -60,33 +78,32 @@ If your target machine includes an NVIDIA GPU, you can add the following configu
 ### Build buddy-mlir
 
 ```
-$ cd buddy-mlir
-$ mkdir build
-$ cd build
-$ cmake -G Ninja .. \
-    -DMLIR_DIR=$PWD/../llvm/build/lib/cmake/mlir \
-    -DLLVM_DIR=$PWD/../llvm/build/lib/cmake/llvm \
+cd buddy-mlir
+cmake -G Ninja -S . -B build \
+    -DMLIR_DIR=$PWD/llvm/build/lib/cmake/mlir \
+    -DLLVM_DIR=$PWD/llvm/build/lib/cmake/llvm \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DCMAKE_BUILD_TYPE=RELEASE \
     -DBUDDY_MLIR_ENABLE_PYTHON_PACKAGES=ON \
-    -DPython3_EXECUTABLE=$(which python3)
-$ ninja
-$ ninja check-buddy
+    -DPython3_EXECUTABLE="$(which python)" \
+    -DPython_EXECUTABLE="$(which python)"
+ninja -C build
+ninja -C build check-buddy
 ```
 
 Set the `PYTHONPATH` environment variable to include both the LLVM/MLIR Python bindings and `buddy-mlir` Python packages:
 
 ```
-$ export BUDDY_MLIR_BUILD_DIR=$PWD
-$ export LLVM_MLIR_BUILD_DIR=$PWD/../llvm/build
-$ export PYTHONPATH=${BUDDY_MLIR_BUILD_DIR}/python_packages:${PYTHONPATH}
+export BUDDY_MLIR_BUILD_DIR=$PWD/build
+export LLVM_MLIR_BUILD_DIR=$PWD/llvm/build
+export PYTHONPATH=${BUDDY_MLIR_BUILD_DIR}/python_packages:${PYTHONPATH}
 ```
 
 If you want to test your model end-to-end conversion and inference, you can add the following configuration
 
 ```
-$ cmake -G Ninja .. -DBUDDY_ENABLE_E2E_TESTS=ON
-$ ninja check-e2e
+cmake -G Ninja -S . -B build -DBUDDY_ENABLE_E2E_TESTS=ON
+ninja -C build check-e2e
 ```
 
 ### Building and running the model
@@ -98,6 +115,26 @@ cd buddy-mlir
 python3 tools/buddy-codegen/build_model.py \
   --spec models/deepseek_r1/specs/f32.json \
   --build-dir build
+```
+
+For Whisper, use the same build entry point with the Whisper spec:
+
+```bash
+python3 tools/buddy-codegen/build_model.py \
+  --spec models/whisper/specs/base.json \
+  --build-dir build
+```
+
+DeepSeek R1, Whisper, and Qwen3-VL support template-based layer-partitioned compilation. It is disabled by default. Enable it explicitly by passing
+`--cmake-args=-DBUDDY_MODEL_LAYER_PARTITION=ON` to `build_model.py`. DeepSeek R1 also retains the existing `PartitionedGraphDriver` workflow. See [Layer Partitioning](docs/LayerPartitioning.md) for details.
+
+For example, enable template-based layer partitioning for Whisper with:
+
+```bash
+python3 tools/buddy-codegen/build_model.py \
+  --spec models/whisper/specs/base.json \
+  --build-dir build \
+  --cmake-args=-DBUDDY_MODEL_LAYER_PARTITION=ON
 ```
 
 To import weights from a **local** HuggingFace style directory (offline or a custom path), pass `--local-model` to that directory (it must contain `config.json` and the weight files). If you omit `--hf-config`, `build_model.py` uses `<local-model>/config.json` for codegen when present:
@@ -112,7 +149,16 @@ python3 tools/buddy-codegen/build_model.py \
 If CMake is configured with `-DBUDDY_BUILD_DEEPSEEK_R1_MODEL=ON`, you can build the model with:
 
 ```bash
-ninja deepseek_r1_model_so deepseek_r1_rax buddy-cli
+ninja deepseek_r1_model_so deepseek_r1_rax
+```
+
+To build the DeepSeek R1 f32 tiered KV cache variant for use with `buddy-cli`,
+use the dedicated spec:
+
+```bash
+python3 tools/buddy-codegen/build_model.py \
+  --spec models/deepseek_r1/specs/f32_tiered_kv_cache.json \
+  --build-dir build
 ```
 
 ```bash
@@ -128,6 +174,36 @@ ninja deepseek_r1_model_so deepseek_r1_rax buddy-cli
   --prompt "Tell me a joke in 200 words."
 ```
 
+Whisper uses the same `.rax` / `buddy-cli` deployment path, with an audio input:
+
+```bash
+./build/bin/buddy-cli \
+  --model ./build/models/whisper/whisper.rax \
+  --audio ./build/models/whisper/audio.wav
+```
+
+#### Qwen3-VL (vision-language OCR)
+
+`models/qwen3_vl` is a self-contained vision-language model (ViT + DeepStack
+encoder feeding a dense Qwen3 decoder) that runs end-to-end on buddy-compiled
+kernels via `buddy-cli`. Use the same `tools/buddy-codegen/build_model.py` entry
+point with the Qwen3-VL spec (a local HuggingFace snapshot is required):
+
+```bash
+python3 tools/buddy-codegen/build_model.py \
+  --spec models/qwen3_vl/specs/instruct_2b.json \
+  --build-dir build \
+  --local-model /path/to/Qwen3-VL-2B-Instruct
+
+./build/bin/buddy-cli \
+  --model ./build/models/qwen3_vl/qwen3_vl.rax \
+  --image ./models/qwen3_vl/test_text.png \
+  --prompt "Read all the text in the image."
+```
+
+See [`models/qwen3_vl/README.md`](models/qwen3_vl/README.md) for prerequisites and
+details.
+
 ## Build Python Package
 
 We use `setuptools` to bundle CMake outputs (Python packages, `bin/`, and
@@ -136,13 +212,13 @@ We use `setuptools` to bundle CMake outputs (Python packages, `bin/`, and
 Build x86_64 artifacts:
 
 ```bash
-./scripts/release_wheel_manylinux.sh cp310-cp310 x86_64
+./scripts/release.sh cp312 0.0.0 x86_64
 ```
 
 Build riscv64 artifacts:
 
 ```bash
-./scripts/release_wheel_manylinux.sh cp310-cp310 riscv64
+./scripts/release.sh cp312 0.0.0 riscv64
 ```
 
 This script calls `docker run` internally to enter the offical manylinux container,
@@ -177,7 +253,7 @@ Before contributing, please read the [Contributor Guide](https://buddycompiler.c
 To maintain code quality, this project provides pre-commit checks:
 
 ```
-$ pre-commit install
+pre-commit install
 ```
 
 ## How to Cite

@@ -17,13 +17,9 @@
 // Source tree: buddy-mlir/runtime/include/buddy/runtime/core/InferenceRunner.h
 // Include as:  #include "buddy/runtime/core/InferenceRunner.h"
 //
-// InferenceRunner is the single extension point for buddy-cli:
-//   - Each supported model implements a subclass of InferenceRunner
-//   - buddy-cli reads the model_name from the .rax manifest and constructs
-//     the right runner via the model name
-//
-// Current implementations:
-//   deepseek_r1  →  DeepSeekR1Runner  (models/deepseek_r1/)
+// InferenceRunner is the single extension point for buddy-cli. Each supported
+// model implements a subclass and exports it from a runner plugin shared
+// library through the C ABI declared below.
 //
 //===----------------------------------------------------------------------===//
 
@@ -50,9 +46,29 @@ struct RunConfig {
   std::string vocabPath;
 
   std::string prompt;
-  /// Upper bound on total sequence length (prompt + generated), in tokens.
-  /// 0 = no limit (generate until stop token or interrupt).
+  /// Optional batch prompts. When set, runners may use one prompt per batch
+  /// element instead of broadcasting `prompt`.
+  std::vector<std::string> prompts;
+
+  /// Path to an audio file (e.g. .wav) for speech models such as Whisper.
+  /// Ignored by text-only LLM runners. Empty = let the runner pick a default.
+  std::string audioPath;
+
+  /// Optional fixed prompt/prefill length. 0 means use the encoded prompt
+  /// length for single-prompt runs, or the longest encoded prompt for batched
+  /// prompt-file runs.
+  int promptLength = 0;
+
+  /// Upper bound on generated tokens. The first generated token comes from
+  /// prefill; subsequent tokens come from decode. 0 = no limit.
   int maxNewTokens = 4096;
+
+  /// Runtime batch size override. 0 means use the packaged model default.
+  int batchSize = 0;
+
+  /// Optional image input for vision-language models (ignored by text models).
+  /// May be an image path or a pre-processed pixel_values blob, per the runner.
+  std::string imagePath;
 
   // ── Sampling configuration ──
   buddy::SamplerConfig samplerConfig;
@@ -64,6 +80,16 @@ struct RunConfig {
   // ── Output control ──
   /// Suppress performance statistics output.
   bool suppressStats = false;
+
+  /// Print every batch element's prompt/output instead of only user0.
+  bool printAllBatchOutputs = false;
+
+  /// Defer device-side token-id readback until the end of the decode loop when
+  /// the runner can feed each decode token tensor directly into the next step.
+  bool deferDecodeTokenReadback = false;
+
+  /// Emit machine-readable token events as JSON Lines on stdout.
+  bool streamJsonl = false;
 
   // ── Interactive mode ──
   /// Enable REPL interactive mode for multi-turn conversation.
@@ -83,6 +109,9 @@ public:
   virtual ~InferenceRunner() = default;
   virtual void run(const RunConfig &cfg) = 0;
 };
+
+using CreateInferenceRunnerFn = InferenceRunner *(*)();
+using DestroyInferenceRunnerFn = void (*)(InferenceRunner *);
 
 } // namespace runtime
 } // namespace buddy

@@ -18,23 +18,20 @@ if(IS_RVV_PLATFORM)
   set(RISCV_LINK_OPTS "-march=rv64gcv;-mabi=lp64d")
 else()
   set(OPENMP_NUM_THREADS "num-threads=48")
-  set(LLC_RISCV_ATTRS "")
+  set(LLC_RISCV_ATTRS "-mcpu=native")
 endif()
 
-# Skip import commands on RVV platform
-if(NOT IS_RVV_PLATFORM)
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_0_6b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_0_6b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_0_6b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_0_6b.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0_0_6b.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-qwen3.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-            --precision f32
-    COMMENT "Generating forward_prefill.mlir, subgraph0_prefill.mlir and arg0.data..."
-  )
-endif()
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_0_6b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_0_6b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_0_6b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_0_6b.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0_0_6b.data
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-qwen3.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --precision f32
+  COMMENT "Generating forward_prefill.mlir, subgraph0_prefill.mlir and arg0.data..."
+)
 
 add_custom_command(
   OUTPUT forward_prefill_0_6b.o
@@ -227,7 +224,7 @@ add_custom_command(
             -reconcile-unrealized-casts |
           ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
           ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
-          ${LLVM_TOOLS_BINARY_DIR}/llc -filetype=obj -relocation-model=pic -O3
+          ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
             -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode_0_6b.o
     DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_0_6b.mlir
     COMMENT "Building subgraph_decode.o "

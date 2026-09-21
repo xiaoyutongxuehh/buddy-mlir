@@ -17,8 +17,7 @@
 # ===----------------------------------------------------------------------===//
 #
 # You maintain **one** JSON file under models/<family>/specs/ (e.g. w8a16.json).
-# This script configures the Buddy build (sets BUDDY_BUILD_DEEPSEEK_R1_MODEL=ON;
-# DeepSeek R1 uses buddy-codegen only) and builds the model + CLI in one shot.
+# This script configures the Buddy build and builds the model artifacts.
 #
 # Usage: relative paths
 # (--spec, --build-dir, --hf-config, --local-model, --source-dir) are
@@ -56,6 +55,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -67,7 +67,7 @@ def _repo_root() -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="One-command build: single variant spec JSON → codegen + buddy-cli + .rax"
+        description="One-command build: single variant spec JSON → codegen + model artifacts"
     )
     ap.add_argument(
         "--spec",
@@ -91,9 +91,10 @@ def main() -> int:
         "--local-model",
         type=Path,
         default=None,
-        help="Local HuggingFace-format model directory for PyTorch import (sets "
-        "BUDDY_DSR1_LOCAL_MODEL). If --hf-config is omitted and <dir>/config.json "
-        "exists, it is used for gen_config.",
+        help="Local HuggingFace-format model directory for PyTorch import. "
+        "For deepseek_r1, this sets BUDDY_DSR1_LOCAL_MODEL and may provide "
+        "config.json. For qwen3_vl and bge_m3, this is required and sets "
+        "BUDDY_QWEN3_VL_MODEL_PATH / BUDDY_BGE_M3_MODEL_PATH.",
     )
     ap.add_argument(
         "--no-configure",
@@ -108,8 +109,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--target",
-        default="deepseek_r1_rax;buddy-cli",
-        help="Semicolon-separated CMake targets (default: deepseek_r1_rax;buddy-cli)",
+        default=None,
+        help="Semicolon-separated CMake targets (default: inferred from spec model_family)",
     )
     ap.add_argument(
         "--jobs",
@@ -175,6 +176,26 @@ def main() -> int:
     spec = resolve_from_cwd(args.spec)
     if not spec.is_file():
         print(f"error: spec not found: {spec}", file=sys.stderr)
+        return 1
+    try:
+        spec_data = json.loads(spec.read_text())
+    except Exception as e:
+        print(f"error: failed to read spec JSON {spec}: {e}", file=sys.stderr)
+        return 1
+    model_family = spec_data.get("model_family")
+    if model_family not in {
+        "deepseek_r1",
+        "whisper",
+        "qwen3_vl",
+        "bge_m3",
+        "proteinglm",
+    }:
+        print(
+            "error: unsupported model_family in spec: "
+            f"{model_family!r} (supported: deepseek_r1, whisper, qwen3_vl, "
+            "bge_m3, proteinglm)",
+            file=sys.stderr,
+        )
         return 1
 
     build_dir = resolve_from_cwd(args.build_dir)
@@ -244,22 +265,103 @@ def main() -> int:
             return 1
 
     cmake_args = [
-        f"-DBUDDY_DSR1_SPEC={spec}",
-        "-DBUDDY_BUILD_DEEPSEEK_R1_MODEL=ON",
-        # Syncs frontend/Python → build/python_packages/buddy/compiler (import_model.py).
-        # Without this, buddy_add_model sets PYTHONPATH but the tree is empty → No module named 'buddy'.
+        # Syncs frontend/Python → build/python_packages/buddy/compiler (import scripts).
+        # Without this, buddy_add_model sets PYTHONPATH but the tree is empty.
         "-DBUDDY_MLIR_ENABLE_PYTHON_PACKAGES=ON",
     ]
-    if local_model is not None:
-        cmake_args.append(f"-DBUDDY_DSR1_LOCAL_MODEL={local_model}")
+    if model_family == "deepseek_r1":
+        cmake_args.extend(
+            [
+                f"-DBUDDY_DSR1_SPEC={spec}",
+                "-DBUDDY_BUILD_DEEPSEEK_R1_MODEL=ON",
+            ]
+        )
+        if local_model is not None:
+            cmake_args.append(f"-DBUDDY_DSR1_LOCAL_MODEL={local_model}")
 
-    if args.hf_config is not None:
-        hf = resolve_from_cwd(args.hf_config)
-        cmake_args.append(f"-DBUDDY_DSR1_HF_CONFIG={hf}")
-    elif local_model is not None:
-        auto_cfg = local_model / "config.json"
-        if auto_cfg.is_file():
-            cmake_args.append(f"-DBUDDY_DSR1_HF_CONFIG={auto_cfg}")
+        if args.hf_config is not None:
+            hf = resolve_from_cwd(args.hf_config)
+            cmake_args.append(f"-DBUDDY_DSR1_HF_CONFIG={hf}")
+        elif local_model is not None:
+            auto_cfg = local_model / "config.json"
+            if auto_cfg.is_file():
+                cmake_args.append(f"-DBUDDY_DSR1_HF_CONFIG={auto_cfg}")
+    elif model_family == "whisper":
+        cmake_args.extend(
+            [
+                f"-DBUDDY_WHISPER_SPEC={spec}",
+                "-DBUDDY_BUILD_WHISPER_MODEL=ON",
+            ]
+        )
+        if local_model is not None:
+            cmake_args.append(f"-DBUDDY_WHISPER_MODEL_PATH={local_model}")
+        if args.hf_config is not None:
+            print(
+                "warning: --hf-config is ignored for whisper; the Whisper "
+                "importer uses --spec and optional --local-model.",
+                file=sys.stderr,
+            )
+    elif model_family == "qwen3_vl":
+        if local_model is None:
+            print(
+                "error: model_family=qwen3_vl requires --local-model "
+                "(local HuggingFace-format Qwen3-VL snapshot)",
+                file=sys.stderr,
+            )
+            return 1
+        cmake_args.extend(
+            [
+                f"-DBUDDY_QWEN3_VL_SPEC={spec}",
+                "-DBUDDY_BUILD_QWEN3_VL_MODEL=ON",
+                f"-DBUDDY_QWEN3_VL_MODEL_PATH={local_model}",
+            ]
+        )
+        if args.hf_config is not None:
+            print(
+                "warning: --hf-config is ignored for qwen3_vl; the Qwen3-VL "
+                "importer uses --spec and optional --local-model.",
+                file=sys.stderr,
+            )
+    elif model_family == "bge_m3":
+        if local_model is None:
+            print(
+                "error: model_family=bge_m3 requires --local-model "
+                "(local HuggingFace-format BGE-M3 snapshot)",
+                file=sys.stderr,
+            )
+            return 1
+        cmake_args.extend(
+            [
+                f"-DBUDDY_BGE_M3_SPEC={spec}",
+                "-DBUDDY_BUILD_BGE_M3_MODEL=ON",
+                f"-DBUDDY_BGE_M3_MODEL_PATH={local_model}",
+            ]
+        )
+        if args.hf_config is not None:
+            print(
+                "warning: --hf-config is ignored for model_family=bge_m3",
+                file=sys.stderr,
+            )
+    elif model_family == "proteinglm":
+        if local_model is None:
+            print(
+                "error: model_family=proteinglm requires --local-model "
+                "(local ProteinGLM HuggingFace snapshot)",
+                file=sys.stderr,
+            )
+            return 1
+        cmake_args.extend(
+            [
+                f"-DBUDDY_PROTEINGLM_SPEC={spec}",
+                "-DBUDDY_BUILD_PROTEINGLM_MODEL=ON",
+                f"-DBUDDY_PROTEINGLM_MODEL_PATH={local_model}",
+            ]
+        )
+        if args.hf_config is not None:
+            print(
+                "warning: --hf-config is ignored for model_family=proteinglm",
+                file=sys.stderr,
+            )
 
     if args.is_rvv_crosscompile:
         cmake_args.extend(
@@ -291,8 +393,9 @@ def main() -> int:
         if rc != 0:
             return rc
 
+    target = args.target or f"{model_family}_rax"
     build_cmd = ["cmake", "--build", str(build_dir), "--target"]
-    build_cmd.extend(args.target.split(";"))
+    build_cmd.extend(target.split(";"))
     if args.jobs > 0:
         build_cmd.extend(["-j", str(args.jobs)])
     rc = run(build_cmd)

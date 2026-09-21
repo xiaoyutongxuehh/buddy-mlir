@@ -2,6 +2,8 @@
 set(BUFFERIZE_FULL_OPTS "unknown-type-conversion=identity-layout-map function-boundary-type-conversion=identity-layout-map bufferize-function-boundaries")
 set(BUFFERIZE_SIMPLE_OPTS "bufferize-function-boundaries")
 set(TOSA_PIPELINE "builtin.module(func.func(tosa-to-linalg-named),func.func(tosa-to-linalg),func.func(tosa-to-tensor),func.func(tosa-to-arith))")
+set(DEEPSEEKR1_IMPORT_PYTHONPATH
+    "${CMAKE_BINARY_DIR}/python_packages:${LLVM_BINARY_DIR}/tools/mlir/python_packages/mlir_core:$ENV{PYTHONPATH}")
 
 # Detect RISC-V Vector (RVV) platform
 # Use HAVE_LOCAL_RVV from check_simd.cmake which is already called in the main CMakeLists.txt
@@ -11,102 +13,111 @@ if(HAVE_LOCAL_RVV)
 endif()
 
 # Set platform-specific variables
+set(DEEPSEEKR1_RISCV_MATTR "+m,+d,+v")
+set(DEEPSEEKR1_RISCV_MARCH "rv64gcv")
+if(BUDDY_RISCV_ENABLE_ZFH_ZVFH)
+  string(APPEND DEEPSEEKR1_RISCV_MATTR ",+zfh,+zvfh")
+  set(DEEPSEEKR1_RISCV_MARCH "rv64gcv_zfh_zvfh")
+endif()
+
 if(IS_RVV_PLATFORM)
   set(OPENMP_NUM_THREADS "num-threads=32")
-  set(LLC_RISCV_ATTRS "-mattr=+m,+d,+v")
-  set(RISCV_COMPILE_OPTS "-march=rv64gcv;-mabi=lp64d;-O3;-Wall")
-  set(RISCV_LINK_OPTS "-march=rv64gcv;-mabi=lp64d")
+  set(LLC_RISCV_ATTRS "-mattr=${DEEPSEEKR1_RISCV_MATTR}")
+  set(RISCV_COMPILE_OPTS "-march=${DEEPSEEKR1_RISCV_MARCH};-mabi=lp64d;-O3;-Wall")
+  set(RISCV_LINK_OPTS "-march=${DEEPSEEKR1_RISCV_MARCH};-mabi=lp64d")
 else()
   set(OPENMP_NUM_THREADS "num-threads=48")
   set(LLC_RISCV_ATTRS "-mcpu=native")
 endif()
 
-# Skip import commands on RVV platform
-if(NOT IS_RVV_PLATFORM)
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
+  COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${DEEPSEEKR1_IMPORT_PYTHONPATH}"
+          ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-f16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-f16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-f16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-f16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-f16.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-            --precision f16
-    COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-f16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-f16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-f16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-f16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-f16.data
+  COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${DEEPSEEKR1_IMPORT_PYTHONPATH}"
+          ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --precision f16
+  COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-bf16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-bf16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-bf16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-bf16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-bf16.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-            --precision bf16
-    COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-bf16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-bf16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-bf16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-bf16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-bf16.data
+  COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${DEEPSEEKR1_IMPORT_PYTHONPATH}"
+          ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --precision bf16
+  COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a32.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a32.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a32.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a32.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a32-f32.data
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a32-i8.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a32.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Generating w8a32 quantized forward.mlir, subgraph0.mlir and param data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a32.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a32.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a32.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a32.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a32-f32.data
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a32-i8.data
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a32.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Generating w8a32 quantized forward.mlir, subgraph0.mlir and param data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a8.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a8.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a8.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a8.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a8-f32.data
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a8-i8.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a8.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Generating w8a8 quantized forward.mlir, subgraph0.mlir and param data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a8.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a8.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a8.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a8.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a8-f32.data
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a8-i8.data
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a8.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Generating w8a8 quantized forward.mlir, subgraph0.mlir and param data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w4a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w4a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w4a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w4a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w4a16-f16.data
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w4a16-i4packed.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w4a16.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Generating w4a16 quantized forward.mlir, subgraph0.mlir and param data..."
-  )
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w4a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w4a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w4a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w4a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w4a16-f16.data
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w4a16-i4packed.data
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w4a16.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Generating w4a16 quantized forward.mlir, subgraph0.mlir and param data..."
+)
 
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a16.mlir
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a16-f16.data
-           ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a16-i8.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a16.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Generating w8a16 quantized forward.mlir, subgraph0.mlir and param data..."
-  )
-
-endif()
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-w8a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill-w8a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-w8a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode-w8a16.mlir
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a16-f16.data
+          ${CMAKE_CURRENT_BINARY_DIR}/arg0-w8a16-i8.data
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-w8a16.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Generating w8a16 quantized forward.mlir, subgraph0.mlir and param data..."
+)
 
 add_custom_command(
   OUTPUT forward_prefill.o
@@ -235,7 +246,6 @@ add_custom_command(
             -matmul-vectorization-blis
             -batchmatmul-optimize
             -convert-linalg-to-affine-loops
-            -affine-parallelize
             -convert-vector-to-scf
             -lower-affine
             -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
@@ -312,6 +322,318 @@ add_custom_command(
             -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode.o
     DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode.mlir
     COMMENT "Building subgraph_decode.o "
+    VERBATIM)
+
+# ── Decode-only weight panel-packing (see the pack_decode_matmul_weights
+# graph transform and MatMulVectorizationDecodePacked.cpp). Written to its own
+# subdirectory so it doesn't clobber the plain f32 outputs above.
+set(PACKED_DECODE_DIR ${CMAKE_CURRENT_BINARY_DIR}/packed_decode)
+
+# pack_decode_matmul_weights repacks every matmul weight in the decode graph,
+# producing a second parameter file (arg0-decode.data) that is the same size and
+# layout as arg0.data with only the bytes inside each weight permuted. Prefill
+# is handed the plain one, decode the packed one; that is the whole difference.
+set(PACKED_DECODE_VECTOR_SIZE 32)
+set(PACKED_DECODE_F16_DIR ${CMAKE_CURRENT_BINARY_DIR}/packed_decode_f16)
+
+add_custom_command(
+  OUTPUT ${PACKED_DECODE_DIR}/forward_prefill.mlir
+          ${PACKED_DECODE_DIR}/subgraph0_prefill.mlir
+          ${PACKED_DECODE_DIR}/forward_decode.mlir
+          ${PACKED_DECODE_DIR}/subgraph0_decode.mlir
+          ${PACKED_DECODE_DIR}/arg0.data
+          ${PACKED_DECODE_DIR}/arg0-decode.data
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${PACKED_DECODE_DIR}
+  COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${DEEPSEEKR1_IMPORT_PYTHONPATH}"
+          ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
+          --output-dir ${PACKED_DECODE_DIR}
+          --pack-decode-weights --pack-vector-size ${PACKED_DECODE_VECTOR_SIZE}
+  COMMENT "Generating packed-decode forward.mlir, subgraph0.mlir and weight data..."
+)
+
+add_custom_command(
+  OUTPUT forward_prefill-packed.o
+  COMMAND ${BUDDY_BINARY_DIR}/buddy-opt ${PACKED_DECODE_DIR}/forward_prefill.mlir
+            -simplify-tosa-reshape |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-opt
+            -pass-pipeline ${TOSA_PIPELINE} |
+          ${BUDDY_BINARY_DIR}/buddy-opt
+            -eliminate-empty-tensors
+            -empty-tensor-to-alloc-tensor
+            -one-shot-bufferize=${BUFFERIZE_SIMPLE_OPTS}
+            -expand-strided-metadata
+            -ownership-based-buffer-deallocation
+            -canonicalize
+            -buffer-deallocation-simplification
+            -bufferization-lower-deallocations
+            -cse
+            -canonicalize
+            -optimize-allocation-liveness
+            -eliminate-memref-copy
+            -assume-tight-memref-layout
+            -staticize-memref-layout
+            -matmul-vectorization-blis
+            -batchmatmul-optimize
+            -convert-linalg-to-affine-loops
+            -affine-parallelize
+            -convert-vector-to-scf
+            -lower-affine
+            -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
+            -memref-expand
+            -arith-expand
+            -convert-vector-to-llvm
+            -convert-arith-to-llvm
+            -finalize-memref-to-llvm
+            -convert-scf-to-cf
+            -convert-cf-to-llvm
+            -llvm-request-c-wrappers
+            -convert-openmp-to-llvm
+            -convert-arith-to-llvm
+            -convert-math-to-llvm
+            -convert-math-to-libm
+            -convert-func-to-llvm
+            -reconcile-unrealized-casts |
+        ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
+        ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
+        ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
+          -o ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill-packed.o
+  DEPENDS buddy-opt ${PACKED_DECODE_DIR}/forward_prefill.mlir
+  COMMENT "Building forward_prefill-packed.o "
+  VERBATIM)
+
+add_custom_command(
+    OUTPUT subgraph_prefill-packed.o
+    COMMAND ${BUDDY_BINARY_DIR}/buddy-opt ${PACKED_DECODE_DIR}/subgraph0_prefill.mlir
+              -simplify-tosa-reshape |
+            ${LLVM_TOOLS_BINARY_DIR}/mlir-opt
+              -pass-pipeline ${TOSA_PIPELINE} |
+            ${BUDDY_BINARY_DIR}/buddy-opt
+            -eliminate-empty-tensors
+            -empty-tensor-to-alloc-tensor
+            -convert-elementwise-to-linalg
+            -one-shot-bufferize=${BUFFERIZE_SIMPLE_OPTS}
+            -expand-strided-metadata
+            -ownership-based-buffer-deallocation
+            -canonicalize
+            -buffer-deallocation-simplification
+            -bufferization-lower-deallocations
+            -cse
+            -canonicalize
+            -optimize-allocation-liveness
+            -eliminate-memref-copy
+            -assume-tight-memref-layout
+            -staticize-memref-layout
+            -matmul-vectorization-blis
+            -batchmatmul-optimize
+            -batchmatmul-transpose-b-vectorization
+            -convert-linalg-to-affine-loops
+            -affine-parallelize
+            -convert-vector-to-scf
+            -lower-affine
+            -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
+            -cse
+            -memref-expand
+            -arith-expand
+            -convert-vector-to-llvm
+            -convert-arith-to-llvm
+            -finalize-memref-to-llvm
+            -convert-scf-to-cf
+            -convert-cf-to-llvm
+            -llvm-request-c-wrappers
+            -convert-openmp-to-llvm
+            -convert-arith-to-llvm
+            -convert-math-to-llvm
+            -convert-math-to-libm
+            -convert-func-to-llvm
+            -reconcile-unrealized-casts |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
+          ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
+          ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
+            -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_prefill-packed.o
+    DEPENDS buddy-opt ${PACKED_DECODE_DIR}/subgraph0_prefill.mlir
+    COMMENT "Building subgraph_prefill-packed.o "
+    VERBATIM)
+
+# FP16 variant of the packed decode example. The top-level prefill/decode
+# wrappers and the prefill subgraph have the same ABI as the ordinary FP16
+# build, so only the decode subgraph needs a distinct packed-kernel object.
+add_custom_command(
+  OUTPUT ${PACKED_DECODE_F16_DIR}/forward_prefill-f16.mlir
+         ${PACKED_DECODE_F16_DIR}/subgraph0_prefill-f16.mlir
+         ${PACKED_DECODE_F16_DIR}/forward_decode-f16.mlir
+         ${PACKED_DECODE_F16_DIR}/subgraph0_decode-f16.mlir
+         ${PACKED_DECODE_F16_DIR}/arg0-f16.data
+         ${PACKED_DECODE_F16_DIR}/arg0-decode.data
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${PACKED_DECODE_F16_DIR}
+  COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${DEEPSEEKR1_IMPORT_PYTHONPATH}"
+          ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
+          --output-dir ${PACKED_DECODE_F16_DIR}
+          --precision f16
+          --pack-decode-weights --pack-vector-size ${PACKED_DECODE_VECTOR_SIZE}
+  COMMENT "Generating FP16 packed-decode MLIR and weight data..."
+)
+
+add_custom_command(
+  OUTPUT subgraph_decode-packed-f16.o
+  COMMAND ${BUDDY_BINARY_DIR}/buddy-opt
+            ${PACKED_DECODE_F16_DIR}/subgraph0_decode-f16.mlir
+            -simplify-tosa-reshape
+            -simplify-tosa-matmul-scalar |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-opt
+            -pass-pipeline ${TOSA_PIPELINE} |
+          ${BUDDY_BINARY_DIR}/buddy-opt
+            -eliminate-empty-tensors
+            -empty-tensor-to-alloc-tensor
+            -convert-elementwise-to-linalg
+            -one-shot-bufferize=${BUFFERIZE_SIMPLE_OPTS}
+            -expand-strided-metadata
+            -ownership-based-buffer-deallocation
+            -canonicalize
+            -buffer-deallocation-simplification
+            -bufferization-lower-deallocations
+            -cse
+            -canonicalize
+            -optimize-allocation-liveness
+            -eliminate-memref-copy
+            -assume-tight-memref-layout
+            -staticize-memref-layout
+            "-matmul-vectorization-decode-packed=vector-size=${PACKED_DECODE_VECTOR_SIZE}"
+            -matmul-vectorization-decode=vector-size=32
+            -batch-matmul-vectorization-decode=vector-size=128
+            -batchmatmul-transpose-b-vectorization=vector-size=16
+            -convert-linalg-to-affine-loops
+            -convert-vector-to-scf
+            -lower-affine
+            -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
+            -cse
+            -memref-expand
+            -arith-expand
+            -convert-vector-to-llvm
+            -convert-arith-to-llvm
+            -finalize-memref-to-llvm
+            -convert-scf-to-cf
+            -convert-cf-to-llvm
+            -llvm-request-c-wrappers
+            -convert-openmp-to-llvm
+            -convert-arith-to-llvm
+            -convert-math-to-llvm
+            -convert-math-to-libm
+            -convert-func-to-llvm
+            -reconcile-unrealized-casts |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
+          ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
+          ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj
+            -relocation-model=pic -O3
+            -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode-packed-f16.o
+  DEPENDS buddy-opt ${PACKED_DECODE_F16_DIR}/subgraph0_decode-f16.mlir
+  COMMENT "Building FP16 packed decode subgraph object"
+  VERBATIM)
+
+add_custom_command(
+  OUTPUT forward_decode-packed.o
+  COMMAND ${BUDDY_BINARY_DIR}/buddy-opt ${PACKED_DECODE_DIR}/forward_decode.mlir
+            -simplify-tosa-reshape |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-opt
+            -pass-pipeline ${TOSA_PIPELINE} |
+          ${BUDDY_BINARY_DIR}/buddy-opt
+            -eliminate-empty-tensors
+            -empty-tensor-to-alloc-tensor
+            -one-shot-bufferize=${BUFFERIZE_SIMPLE_OPTS}
+            -expand-strided-metadata
+            -ownership-based-buffer-deallocation
+            -canonicalize
+            -buffer-deallocation-simplification
+            -bufferization-lower-deallocations
+            -cse
+            -canonicalize
+            -optimize-allocation-liveness
+            -eliminate-memref-copy
+            -assume-tight-memref-layout
+            -staticize-memref-layout
+            -matmul-vectorization-blis
+            -batchmatmul-optimize
+            -convert-linalg-to-affine-loops
+            -affine-parallelize
+            -convert-vector-to-scf
+            -lower-affine
+            -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
+            -memref-expand
+            -arith-expand
+            -convert-vector-to-llvm
+            -convert-arith-to-llvm
+            -finalize-memref-to-llvm
+            -convert-scf-to-cf
+            -convert-cf-to-llvm
+            -llvm-request-c-wrappers
+            -convert-openmp-to-llvm
+            -convert-arith-to-llvm
+            -convert-math-to-llvm
+            -convert-math-to-libm
+            -convert-func-to-llvm
+            -reconcile-unrealized-casts |
+        ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
+        ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
+        ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
+          -o ${CMAKE_CURRENT_BINARY_DIR}/forward_decode-packed.o
+  DEPENDS buddy-opt ${PACKED_DECODE_DIR}/forward_decode.mlir
+  COMMENT "Building forward_decode-packed.o "
+  VERBATIM)
+
+add_custom_command(
+    OUTPUT subgraph_decode-packed.o
+    COMMAND ${BUDDY_BINARY_DIR}/buddy-opt ${PACKED_DECODE_DIR}/subgraph0_decode.mlir
+              -simplify-tosa-reshape
+              -simplify-tosa-matmul-scalar |
+            ${LLVM_TOOLS_BINARY_DIR}/mlir-opt
+              -pass-pipeline ${TOSA_PIPELINE} |
+            ${BUDDY_BINARY_DIR}/buddy-opt
+            -eliminate-empty-tensors
+            -empty-tensor-to-alloc-tensor
+            -convert-elementwise-to-linalg
+            -one-shot-bufferize=${BUFFERIZE_SIMPLE_OPTS}
+            -expand-strided-metadata
+            -ownership-based-buffer-deallocation
+            -canonicalize
+            -buffer-deallocation-simplification
+            -bufferization-lower-deallocations
+            -cse
+            -canonicalize
+            -optimize-allocation-liveness
+            -eliminate-memref-copy
+            -assume-tight-memref-layout
+            -staticize-memref-layout
+            # No packed-shapes: every matmul weight here is packed.
+            "-matmul-vectorization-decode-packed=vector-size=${PACKED_DECODE_VECTOR_SIZE}"
+            -matmul-vectorization-decode=vector-size=32
+            -batch-matmul-vectorization-decode=vector-size=128
+            -batchmatmul-transpose-b-vectorization=vector-size=16
+            -convert-linalg-to-affine-loops
+            -convert-vector-to-scf
+            -lower-affine
+            -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
+            -cse
+            -memref-expand
+            -arith-expand
+            -convert-vector-to-llvm
+            -convert-arith-to-llvm
+            -finalize-memref-to-llvm
+            -convert-scf-to-cf
+            -convert-cf-to-llvm
+            -llvm-request-c-wrappers
+            -convert-openmp-to-llvm
+            -convert-arith-to-llvm
+            -convert-math-to-llvm
+            -convert-math-to-libm
+            -convert-func-to-llvm
+            -reconcile-unrealized-casts |
+          ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
+          ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
+          ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
+            -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode-packed.o
+    DEPENDS buddy-opt ${PACKED_DECODE_DIR}/subgraph0_decode.mlir
+    COMMENT "Building subgraph_decode-packed.o "
     VERBATIM)
 
 add_custom_command(
@@ -1517,6 +1839,8 @@ add_library(DEEPSEEKR1_W8A32 STATIC forward_prefill-w8a32.o subgraph_prefill-w8a
 add_library(DEEPSEEKR1_W4A16 STATIC forward_prefill-w4a16.o subgraph_prefill-w4a16.o forward_decode-w4a16.o subgraph_decode-w4a16.o)
 add_library(DEEPSEEKR1_W8A16 STATIC forward_prefill-w8a16.o subgraph_prefill-w8a16.o forward_decode-w8a16.o subgraph_decode-w8a16.o)
 add_library(DEEPSEEKR1_W8A8 STATIC forward_prefill-w8a8.o subgraph_prefill-w8a8.o forward_decode-w8a8.o subgraph_decode-w8a8.o)
+add_library(DEEPSEEKR1_PACKED STATIC forward_prefill-packed.o subgraph_prefill-packed.o forward_decode-packed.o subgraph_decode-packed.o)
+add_library(DEEPSEEKR1_PACKED_F16 STATIC forward_prefill-f16.o subgraph_prefill-f16.o forward_decode-f16.o subgraph_decode-packed-f16.o)
 
 SET_SOURCE_FILES_PROPERTIES(
   template.o
@@ -1559,6 +1883,16 @@ SET_TARGET_PROPERTIES(
   PROPERTIES
   LINKER_LANGUAGE C)
 
+SET_TARGET_PROPERTIES(
+  DEEPSEEKR1_PACKED
+  PROPERTIES
+  LINKER_LANGUAGE C)
+
+SET_TARGET_PROPERTIES(
+  DEEPSEEKR1_PACKED_F16
+  PROPERTIES
+  LINKER_LANGUAGE C)
+
 add_executable(buddy-deepseek-r1-run buddy-deepseek-r1-main.cpp)
 add_executable(buddy-deepseek-r1-f16-run buddy-deepseek-r1-f16-main.cpp)
 add_executable(buddy-deepseek-r1-bf16-run buddy-deepseek-r1-bf16-main.cpp)
@@ -1566,10 +1900,22 @@ add_executable(buddy-deepseek-r1-w8a32-run buddy-deepseek-r1-w8a32-main.cpp)
 add_executable(buddy-deepseek-r1-w8a8-run buddy-deepseek-r1-w8a8-main.cpp)
 add_executable(buddy-deepseek-r1-w4a16-run buddy-deepseek-r1-w4a16-main.cpp)
 add_executable(buddy-deepseek-r1-w8a16-run buddy-deepseek-r1-w8a16-main.cpp)
+add_executable(buddy-deepseek-r1-packed-run buddy-deepseek-r1-packed-main.cpp)
+add_executable(buddy-deepseek-r1-packed-f16-run buddy-deepseek-r1-f16-main.cpp)
 add_executable(buddy-deepseek-r1-cli buddy-deepseek-r1-cli.cpp)
 
 set(DEEPSEEKR1_EXAMPLE_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 set(DEEPSEEKR1_EXAMPLE_BUILD_PATH ${CMAKE_CURRENT_BINARY_DIR})
+
+target_compile_definitions(buddy-deepseek-r1-packed-run PRIVATE
+  DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
+  DEEPSEEKR1_EXAMPLE_BUILD_PATH="${PACKED_DECODE_DIR}/"
+)
+target_compile_definitions(buddy-deepseek-r1-packed-f16-run PRIVATE
+  DEEPSEEKR1_PACKED_DECODE=1
+  DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
+  DEEPSEEKR1_EXAMPLE_BUILD_PATH="${PACKED_DECODE_F16_DIR}/"
+)
 
 target_compile_definitions(buddy-deepseek-r1-run PRIVATE
   DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
@@ -1618,6 +1964,8 @@ target_link_directories(buddy-deepseek-r1-w8a32-run PRIVATE ${LLVM_LIBRARY_DIR})
 target_link_directories(buddy-deepseek-r1-w8a8-run PRIVATE ${LLVM_LIBRARY_DIR})
 target_link_directories(buddy-deepseek-r1-w4a16-run PRIVATE ${LLVM_LIBRARY_DIR})
 target_link_directories(buddy-deepseek-r1-w8a16-run PRIVATE ${LLVM_LIBRARY_DIR})
+target_link_directories(buddy-deepseek-r1-packed-run PRIVATE ${LLVM_LIBRARY_DIR})
+target_link_directories(buddy-deepseek-r1-packed-f16-run PRIVATE ${LLVM_LIBRARY_DIR})
 target_link_directories(buddy-deepseek-r1-cli PRIVATE ${LLVM_LIBRARY_DIR})
 
 set(BUDDY_DEEPSEEKR1_LIBS
@@ -1655,6 +2003,16 @@ set(BUDDY_DEEPSEEKR1_W8A16_LIBS
   mlir_c_runner_utils
   omp
 )
+set(BUDDY_DEEPSEEKR1_PACKED_LIBS
+  DEEPSEEKR1_PACKED
+  mlir_c_runner_utils
+  omp
+)
+set(BUDDY_DEEPSEEKR1_PACKED_F16_LIBS
+  DEEPSEEKR1_PACKED_F16
+  mlir_c_runner_utils
+  omp
+)
 if(BUDDY_MLIR_USE_MIMALLOC)
   list(APPEND BUDDY_DEEPSEEKR1_LIBS mimalloc)
   list(APPEND BUDDY_DEEPSEEKR1_F16_LIBS mimalloc)
@@ -1663,6 +2021,8 @@ if(BUDDY_MLIR_USE_MIMALLOC)
   list(APPEND BUDDY_DEEPSEEKR1_W8A8_LIBS mimalloc)
   list(APPEND BUDDY_DEEPSEEKR1_W4A16_LIBS mimalloc)
   list(APPEND BUDDY_DEEPSEEKR1_W8A16_LIBS mimalloc)
+  list(APPEND BUDDY_DEEPSEEKR1_PACKED_LIBS mimalloc)
+  list(APPEND BUDDY_DEEPSEEKR1_PACKED_F16_LIBS mimalloc)
 endif()
 
 target_link_libraries(buddy-deepseek-r1-run ${BUDDY_DEEPSEEKR1_LIBS})
@@ -1672,6 +2032,8 @@ target_link_libraries(buddy-deepseek-r1-w8a32-run ${BUDDY_DEEPSEEKR1_W8A32_LIBS}
 target_link_libraries(buddy-deepseek-r1-w8a8-run ${BUDDY_DEEPSEEKR1_W8A8_LIBS})
 target_link_libraries(buddy-deepseek-r1-w4a16-run ${BUDDY_DEEPSEEKR1_W4A16_LIBS})
 target_link_libraries(buddy-deepseek-r1-w8a16-run ${BUDDY_DEEPSEEKR1_W8A16_LIBS})
+target_link_libraries(buddy-deepseek-r1-packed-run ${BUDDY_DEEPSEEKR1_PACKED_LIBS})
+target_link_libraries(buddy-deepseek-r1-packed-f16-run ${BUDDY_DEEPSEEKR1_PACKED_F16_LIBS})
 target_link_libraries(buddy-deepseek-r1-cli ${BUDDY_DEEPSEEKR1_LIBS} LLVMOption buddy_runtime_core)
 
 # Create a distributable package
@@ -1707,37 +2069,35 @@ add_custom_target(buddy-deepseek-r1-package
 
 set(KV_CACHE_SIZES 32 64 128 256 512 1024)
 
-if(NOT IS_RVV_PLATFORM)
-  set(TIERED_KV_CACHE_OUTPUTS "")
-  foreach(CACHE_SIZE ${KV_CACHE_SIZES})
-    list(APPEND TIERED_KV_CACHE_OUTPUTS
-      ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_${CACHE_SIZE}.mlir
-      ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_${CACHE_SIZE}.mlir
-    )
-  endforeach()
-  foreach(CACHE_SIZE ${KV_CACHE_SIZES})
-    list(APPEND TIERED_KV_CACHE_OUTPUTS
-      ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_${CACHE_SIZE}.mlir
-      ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_${CACHE_SIZE}.mlir
-    )
-  endforeach()
-
-  add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/arg0_mc.data
-           ${TIERED_KV_CACHE_OUTPUTS}
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-tiered-kv-cache.py
-            --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-            --cache-sizes "32,64,128,256,512,1024"
-            --max-cache-len 1024
-    COMMENT "Generating tiered-kv-cache MLIR files (prefill_32/64/128/256/512/1024 + decode_32/64/128/256/512/1024)..."
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+set(TIERED_KV_CACHE_OUTPUTS "")
+foreach(CACHE_SIZE ${KV_CACHE_SIZES})
+  list(APPEND TIERED_KV_CACHE_OUTPUTS
+    ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_${CACHE_SIZE}.mlir
+    ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_${CACHE_SIZE}.mlir
   )
-
-  add_custom_target(deepseekr1-tiered-kv-cache-import
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/arg0_mc.data
-            ${TIERED_KV_CACHE_OUTPUTS}
+endforeach()
+foreach(CACHE_SIZE ${KV_CACHE_SIZES})
+  list(APPEND TIERED_KV_CACHE_OUTPUTS
+    ${CMAKE_CURRENT_BINARY_DIR}/forward_prefill_${CACHE_SIZE}.mlir
+    ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_${CACHE_SIZE}.mlir
   )
-endif()
+endforeach()
+
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/arg0_mc.data
+          ${TIERED_KV_CACHE_OUTPUTS}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1-tiered-kv-cache.py
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --cache-sizes "32,64,128,256,512,1024"
+          --max-cache-len 1024
+  COMMENT "Generating tiered-kv-cache MLIR files (prefill_32/64/128/256/512/1024 + decode_32/64/128/256/512/1024)..."
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_custom_target(deepseekr1-tiered-kv-cache-import
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/arg0_mc.data
+          ${TIERED_KV_CACHE_OUTPUTS}
+)
 
 foreach(CACHE_SIZE ${KV_CACHE_SIZES})
   add_custom_command(
@@ -1828,7 +2188,7 @@ foreach(CACHE_SIZE ${KV_CACHE_SIZES})
               -reconcile-unrealized-casts |
             ${LLVM_TOOLS_BINARY_DIR}/mlir-translate -mlir-to-llvmir |
             ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
-            ${LLVM_TOOLS_BINARY_DIR}/llc -filetype=obj -relocation-model=pic -O3
+            ${LLVM_TOOLS_BINARY_DIR}/llc ${LLC_RISCV_ATTRS} -filetype=obj -relocation-model=pic -O3
               -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph_decode_${CACHE_SIZE}.o
     DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_${CACHE_SIZE}.mlir
     COMMENT "Building subgraph_decode_${CACHE_SIZE}.o"
@@ -1988,7 +2348,7 @@ target_link_libraries(buddy-deepseek-r1-tiered-kv-cache-run ${BUDDY_DEEPSEEKR1_T
 
 add_custom_target(deepseekr1-tiered-kv-cache
   DEPENDS buddy-deepseek-r1-tiered-kv-cache-run
-  COMMENT "Building DeepSeekR1 tiered-kv-cache inference"
+  COMMENT "Building DeepSeekR1 tiered-kv-cache inference with cache sizes: ${KV_CACHE_SIZES}"
 )
 
 add_test(
@@ -2003,5 +2363,3 @@ set_tests_properties(
     PASS_REGULAR_EXPRESSION "Total time"
     TIMEOUT 3600
 )
-
-message(STATUS "DeepSeekR1 Multi-Cache: Building prefill and decode subgraphs for cache sizes: ${KV_CACHE_SIZES}")
